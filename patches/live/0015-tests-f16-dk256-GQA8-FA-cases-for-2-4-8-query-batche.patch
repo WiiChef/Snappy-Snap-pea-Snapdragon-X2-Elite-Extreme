@@ -1,0 +1,29 @@
+From cc2b9d0584f441ea80d9c0dfce310ce0d8cb7a74 Mon Sep 17 00:00:00 2001
+From: snap-pea <snap-pea@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 08:14:22 -0400
+Subject: [PATCH 15/19] tests: f16 dk256 GQA8 FA cases for 2/4/8-query batches
+ at kv 512/4096
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/test-backend-ops.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b580462..08e83f9 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11549,7 +11549,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+         // f16 KV decode (the MTP draft context); at kv=32768 f16 sits at the NMSE threshold for every kernel
+         if (kv < 32768) {
+-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, { 8, 1 }, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++            for (int nb : { 1, 2, 4, 8, }) {
++                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, { 8, 1 }, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++            }
+         }
+     }
+ 
+-- 
+2.55.0.windows.5
+

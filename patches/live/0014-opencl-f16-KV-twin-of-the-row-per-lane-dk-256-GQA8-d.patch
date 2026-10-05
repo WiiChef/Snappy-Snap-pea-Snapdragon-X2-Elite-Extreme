@@ -1,0 +1,244 @@
+From f563561f3675091c0597245ec0144e3591de5ccf Mon Sep 17 00:00:00 2001
+From: snap-pea <snap-pea@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 07:38:19 -0400
+Subject: [PATCH 14/19] opencl: f16-KV twin of the row-per-lane dk=256 GQA8
+ decode kernel (MTP draft context)
+
+The Qwen3.5/3.6 MoE MTP draft context keeps its own KV in f16 (draft cache types), so its
+attention ran flash_attn_f32_f16_q1_vec_mq_split, ~1.9 ms per call at 32k rows, on every
+draft step and catch-up. kernel_fa_f16_d256_g8_dec mirrors kernel_fa_q8_d256_g8_dec with f16
+K/V (float QK against Q in local memory). A q8_0 draft KV (-ctkd/-ctvd q8_0) reached the
+existing kernel but lowered draft acceptance at short context (80.5 -> 78.7%, 43.75 -> 42.4
+tok/s); keeping f16 with this kernel keeps the short-context drafts and most of the gain:
+
+X2-90 Qwen3.6-35B-A3B, MTP decode after an 85k-token prompt: f16 draft KV 22.9 -> 26.5 tok/s
+(q8_0 draft KV: 27.3). test-backend-ops FLASH_ATTN_EXT 2987/2987 (adds f16 dk256 gqa8 nb=1
+cases at kv 512/4096; at 32768 f16 is at the NMSE threshold for the old kernel too).
+Opt out: GGML_OPENCL_FA_F16_D256_LPR=0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-opencl/ggml-opencl.cpp          |  21 ++-
+ .../kernels/mul_mv_q8_0_f32_flat.cl           | 146 ++++++++++++++++++
+ tests/test-backend-ops.cpp                    |   4 +
+ 3 files changed, 170 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 3f8c621..b11e929 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1601,6 +1601,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_mul_mv_q8_0_q8a_dp4a_mc = nullptr;  // dp4a verify GEMV (2..8 columns)
+     cl_kernel kernel_mul_mv_q8_0_q8a_dp4a_mc_lds = nullptr; // same, activations staged in local memory
+     cl_kernel kernel_fa_q8_d256_g8_dec = nullptr;        // q8_0 KV dk256 gqa8 decode FA split (row-per-lane QK)
++    cl_kernel kernel_fa_f16_d256_g8_dec = nullptr;       // f16 KV twin (MTP draft context)
+     cl_kernel kernel_mul_mat_q8_0_f32_kq_gen = nullptr;
+     cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128 = nullptr;
+     cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128_img = nullptr;
+@@ -6557,6 +6558,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 GGML_LOG_WARN("ggml_opencl: kernel_mul_mv_q8_0_q8a_dp4a_mc_lds unavailable (err %d)\n", err);
+                 backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc_lds = nullptr;
+             }
++            backend_ctx->kernel_fa_f16_d256_g8_dec = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_fa_f16_d256_g8_dec", &err);
++            if (err != CL_SUCCESS) {
++                GGML_LOG_WARN("ggml_opencl: kernel_fa_f16_d256_g8_dec unavailable (err %d)\n", err);
++                backend_ctx->kernel_fa_f16_d256_g8_dec = nullptr;
++            }
+             backend_ctx->kernel_fa_q8_d256_g8_dec = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_fa_q8_d256_g8_dec", &err);
+             if (err != CL_SUCCESS) {
+                 GGML_LOG_WARN("ggml_opencl: kernel_fa_q8_d256_g8_dec unavailable (err %d)\n", err);
+@@ -34070,7 +34076,20 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+             !use_local_tile &&  // local-tile dispatches its own grid, skip MQ FD-split
+             n_kv >= mq_n_kv_floor &&
+             backend_ctx->fa.f32_merge.count(dk_dv) > 0) {
+-            if (nq1_only && lmq_on && is_mixed && d_head_q == 128 && d_head_v == 128 &&
++            // f16 KV dk=256 gqa 8 decode (the MTP draft context of Qwen3.5/3.6 MoE keeps f16 KV):
++            // f16 twin of the row-per-lane kernel. Opt out: GGML_OPENCL_FA_F16_D256_LPR=0.
++            if (nq1_only && is_mixed && d_head_q == 256 && d_head_v == 256 && gqa_ratio_dispatch == 8 &&
++                n_head == n_head_kv * 8 && max_bias == 0.0f && logit_softcap == 0.0f &&
++                (mask == nullptr || mask->type == GGML_TYPE_F16) &&
++                k->nb[0] == sizeof(ggml_fp16_t) && v->nb[0] == sizeof(ggml_fp16_t) &&
++                k->nb[1] % 16 == 0 && v->nb[1] % 8 == 0 &&
++                backend_ctx->kernel_fa_f16_d256_g8_dec != nullptr &&
++                !ggml_cl_env_flag_zero("GGML_OPENCL_FA_F16_D256_LPR")) {
++                fd_k_split  = backend_ctx->kernel_fa_f16_d256_g8_dec;
++                use_fd_mq   = true;
++                fd_mq_wg    = 64;
++                fd_head_sub = 1;
++            } else if (nq1_only && lmq_on && is_mixed && d_head_q == 128 && d_head_v == 128 &&
+                 gqa_ratio_dispatch == 8 &&
+                 backend_ctx->fa.f32_f16_q1_local_mq_split_g8.count(dk_dv) > 0) {
+                 fd_k_split = backend_ctx->fa.f32_f16_q1_local_mq_split_g8.at(dk_dv);
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
+index 42f480e..cb814b9 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
+@@ -734,4 +734,150 @@ kernel void kernel_fa_q8_d256_g8_dec(
+         vstore4(o[h], lid, rec + 2);
+     }
+ }
++// f16-KV twin of kernel_fa_q8_d256_g8_dec (same arguments, records and merge): used for the MTP
++// draft context, whose KV stays f16. QK: a lane owns a KV row, float math against Q in local memory.
++#ifdef ADRENO_GPU
++REQD_SUBGROUP_SIZE_64
++#endif
++kernel void kernel_fa_f16_d256_g8_dec(
++    const global void * q_void, ulong q_offset,
++    const global void * k_void, ulong k_offset,
++    const global void * v_void, ulong v_offset,
++    const float scale,
++    const int n_q,
++    const int n_kv,
++    const int n_head,
++    const ulong q_nb1, const ulong q_nb2, const ulong q_nb3,
++    const ulong k_nb1, const ulong k_nb2, const ulong k_nb3,
++    const ulong v_nb1, const ulong v_nb2, const ulong v_nb3,
++    const float max_bias,
++    const float m0,
++    const float m1,
++    const int n_head_log2,
++    const float logit_softcap,
++    const int n_head_kv,
++    const global void * mask_void,
++    const ulong mask_offset,
++    const ulong mask_nb1,
++    const ulong mask_nb2,
++    const ulong mask_nb3,
++    const int mask_ne2,
++    const int mask_ne3,
++    global float * partial_void,
++    const int n_splits,
++    const int kv_per_split
++) {
++    const int lid         = get_local_id(0);
++    const int hb_idx      = get_global_id(1);
++    const int batch_idx   = hb_idx / n_head_kv;
++    const int head_kv_idx = hb_idx % n_head_kv;
++    const int split_q     = get_global_id(2);
++    const int split_idx   = split_q % n_splits;
++    const int q_idx       = split_q / n_splits;
++
++    const int kv_start = split_idx * kv_per_split;
++    const int kv_end   = min(kv_start + kv_per_split, n_kv);
++    const ulong rec_stride = (ulong) (2 + FAD_DK);
++
++    if (kv_start >= kv_end) {
++        if (lid < FAD_G) {
++            const int head_idx = head_kv_idx * FAD_G + lid;
++            global float * rec = partial_void +
++                ((((ulong) batch_idx * n_head + head_idx) * n_q + q_idx) * n_splits + split_idx) * rec_stride;
++            rec[0] = FAD_MINIT;
++            rec[1] = 0.0f;
++        }
++        return;
++    }
++
++    // Q (8 heads x 256 floats) in local memory, read as float8 broadcasts
++    local float qf[FAD_G * FAD_DK];
++    local float P[64 * FAD_G];
++    for (int i = lid; i < FAD_G * FAD_DK; i += 64) {
++        const int h = i / FAD_DK;
++        const int d = i % FAD_DK;
++        const global float * qr = (const global float *) ((const global char *) q_void + q_offset +
++            batch_idx * q_nb3 + (head_kv_idx * FAD_G + h) * q_nb2 + (ulong) q_idx * q_nb1);
++        qf[i] = qr[d];
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++
++    const global char * k_base = (const global char *) k_void + k_offset + batch_idx * k_nb3 + head_kv_idx * k_nb2;
++    const global char * v_base = (const global char *) v_void + v_offset + batch_idx * v_nb3 + head_kv_idx * v_nb2;
++
++    const global half * mask_row[FAD_G];
++    {
++        const global char * mb = mask_void == NULL ? NULL :
++            (const global char *) mask_void + mask_offset + (batch_idx % mask_ne3) * mask_nb3 + (ulong) q_idx * mask_nb1;
++        for (int h = 0; h < FAD_G; ++h) {
++            mask_row[h] = mb == NULL ? NULL :
++                (const global half *) (mb + ((head_kv_idx * FAD_G + h) % mask_ne2) * mask_nb2);
++        }
++    }
++
++    float  m[FAD_G], l[FAD_G];
++    float4 o[FAD_G];
++    for (int h = 0; h < FAD_G; ++h) { m[h] = FAD_MINIT; l[h] = 0.0f; o[h] = (float4)(0.0f); }
++
++    for (int t0 = kv_start; t0 < kv_end; t0 += 64) {
++        const int  r     = t0 + lid;
++        const bool valid = r < kv_end;
++
++        float s[FAD_G];
++        for (int h = 0; h < FAD_G; ++h) s[h] = 0.0f;
++        if (valid) {
++            const global half * kr = (const global half *) (k_base + (ulong) r * k_nb1);
++            for (int c = 0; c < FAD_DK / 8; ++c) {
++                const float8 kv8 = vload_half8(c, kr);
++                for (int h = 0; h < FAD_G; ++h) {
++                    const float8 q8 = vload8(c, qf + h * FAD_DK);
++                    const float8 pr = kv8 * q8;
++                    s[h] += ((pr.s0 + pr.s1) + (pr.s2 + pr.s3)) + ((pr.s4 + pr.s5) + (pr.s6 + pr.s7));
++                }
++            }
++            for (int h = 0; h < FAD_G; ++h) {
++                s[h] *= scale;
++                if (mask_row[h] != NULL) s[h] += (float) mask_row[h][r];
++            }
++        } else {
++            for (int h = 0; h < FAD_G; ++h) s[h] = FAD_MINIT;
++        }
++
++        for (int h = 0; h < FAD_G; ++h) {
++            const float tmax  = sub_group_reduce_max(s[h]);
++            const float m_new = fmax(m[h], tmax);
++            const float alpha = exp(m[h] - m_new);
++            const float p     = valid ? exp(s[h] - m_new) : 0.0f;
++            l[h] = l[h] * alpha + sub_group_reduce_add(p);
++            m[h] = m_new;
++            o[h] *= alpha;
++            P[lid * FAD_G + h] = p;
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++
++        const int nr = min(64, kv_end - t0);
++        for (int i = 0; i < nr; ++i) {
++            const float4 vv = vload_half4(lid, (const global half *) (v_base + (ulong) (t0 + i) * v_nb1));
++            const float4 p0 = vload4(0, P + i * FAD_G);
++            const float4 p1 = vload4(1, P + i * FAD_G);
++            o[0] = mad((float4)(p0.s0), vv, o[0]);
++            o[1] = mad((float4)(p0.s1), vv, o[1]);
++            o[2] = mad((float4)(p0.s2), vv, o[2]);
++            o[3] = mad((float4)(p0.s3), vv, o[3]);
++            o[4] = mad((float4)(p1.s0), vv, o[4]);
++            o[5] = mad((float4)(p1.s1), vv, o[5]);
++            o[6] = mad((float4)(p1.s2), vv, o[6]);
++            o[7] = mad((float4)(p1.s3), vv, o[7]);
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++    }
++
++    for (int h = 0; h < FAD_G; ++h) {
++        const int head_idx = head_kv_idx * FAD_G + h;
++        global float * rec = partial_void +
++            ((((ulong) batch_idx * n_head + head_idx) * n_q + q_idx) * n_splits + split_idx) * rec_stride;
++        if (lid == 0) { rec[0] = m[h]; rec[1] = l[h]; }
++        vstore4(o[h], lid, rec + 2);
++    }
++}
+ #endif // cl_khr_integer_dot_product
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 622304a..b580462 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11547,6 +11547,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         for (int nb : { 1, 2, 4, 8, }) {
+             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, { 8, 1 }, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+         }
++        // f16 KV decode (the MTP draft context); at kv=32768 f16 sits at the NMSE threshold for every kernel
++        if (kv < 32768) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, { 8, 1 }, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        }
+     }
+ 
+     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
+-- 
+2.55.0.windows.5
+

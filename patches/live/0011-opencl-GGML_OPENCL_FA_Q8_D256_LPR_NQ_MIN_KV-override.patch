@@ -1,0 +1,31 @@
+From 687c4cdf917076a977662bf456c2efd845108d53 Mon Sep 17 00:00:00 2001
+From: snap-pea <snap-pea@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 04:35:40 -0400
+Subject: [PATCH 11/19] opencl: GGML_OPENCL_FA_Q8_D256_LPR_NQ_MIN_KV overrides
+ the 2048-row floor of the verify-attention route
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-opencl/ggml-opencl.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 3293d01..3f8c621 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -33173,7 +33173,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     // group) instead of the decompose path, whose cost grows ~10x faster with depth
+     // (X2-90 Qwen3.6-35B-A3B pp5: +51 ms per batch at d32768 vs +5.5 ms for a decode step).
+     // Opt out: GGML_OPENCL_FA_Q8_D256_LPR_NQ=0.
+-    const bool lpr_nq = n_q >= 2 && n_q <= 8 && n_kv >= 2048 &&
++    static const int lpr_nq_min_kv = []{
++        const char * e = getenv("GGML_OPENCL_FA_Q8_D256_LPR_NQ_MIN_KV");
++        return (e && e[0]) ? atoi(e) : 2048;
++    }();
++    const bool lpr_nq = n_q >= 2 && n_q <= 8 && n_kv >= lpr_nq_min_kv &&
+         k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 && q->type == GGML_TYPE_F32 &&
+         d_head_q == 256 && d_head_v == 256 && n_head == n_head_kv * 8 && sinks == nullptr &&
+         ((const float *) dst->op_params)[1] == 0.0f && ((const float *) dst->op_params)[2] == 0.0f &&
+-- 
+2.55.0.windows.5
+

@@ -1,0 +1,489 @@
+From a6f184c592d37b2c78211e2652591e36f3b73534 Mon Sep 17 00:00:00 2001
+From: snap-pea <snap-pea@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 02:04:10 -0400
+Subject: [PATCH 08/19] opencl: faster q8_0 speculative-verify GEMVs (small-M
+ split-K, lm_head local-memory activations)
+
+Verify batches (2..8 columns) on Qwen3.6-35B-A3B:
+- small-M dense weights (M <= 2048: shared-expert gate/up/down, K/V) went to the
+  cooperative-K GEMM, which tiles 4 rows per lane into 64-lane work-groups: M = 512
+  is two work-groups on the 16-CU X2-90. New kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk:
+  int8 activations, weights read once for all columns, K split over up to 8 slices
+  (at least two blocks per slice), summed by kernel_gemv_splitk_reduce_f32.
+  512x2048 n=5: 45.4 -> 15.8 us; 2048x512 n=5: 17.2 -> 15.5 us.
+  Opt out: GGML_OPENCL_Q8_NS_MC_SPLITK=0, slices: GGML_OPENCL_Q8_NS_MC_KSPLIT.
+- the multi-column dp4a GEMV (lm_head 248320x2048) re-read all columns' activations
+  per subgroup; kernel_mul_mv_q8_0_q8a_dp4a_mc_lds stages them in local memory once
+  per 8-subgroup work-group (ncol*K <= 16 KB). n=5: 8689 -> 7893 us.
+  Subgroups: GGML_OPENCL_Q8_MC_LDS_NSG (0 = old kernel). Column loops unrolled.
+
+pp5 @ d512: 73.0 -> 76.4 t/s. Agent-prompt MTP bench (temp 0.6, 4 prompts x 2 seeds,
+2 reps): 39.6 -> 40.9 tok/s. test-backend-ops MUL_MAT 1690/1690. Adds q6_K MUL_MAT_ID
+2..8-token eval cases and Qwen3.6 verify-shape MUL_MAT perf cases.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-opencl/ggml-opencl.cpp          | 106 +++++++++++++++-
+ .../kernels/gemv_noshuffle_q8_0_f32.cl        |  92 ++++++++++++++
+ .../kernels/mul_mv_q8_0_f32_flat.cl           | 116 +++++++++++++++---
+ tests/test-backend-ops.cpp                    |  17 +++
+ 4 files changed, 313 insertions(+), 18 deletions(-)
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index eee4cdc..9cce1aa 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1599,6 +1599,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_mul_mv_q8_0_f32_flat_mc8 = nullptr;
+     cl_kernel kernel_q8mc_quant_act = nullptr;           // dp4a verify GEMV: activation quantizer
+     cl_kernel kernel_mul_mv_q8_0_q8a_dp4a_mc = nullptr;  // dp4a verify GEMV (2..8 columns)
++    cl_kernel kernel_mul_mv_q8_0_q8a_dp4a_mc_lds = nullptr; // same, activations staged in local memory
+     cl_kernel kernel_fa_q8_d256_g8_dec = nullptr;        // q8_0 KV dk256 gqa8 decode FA split (row-per-lane QK)
+     cl_kernel kernel_mul_mat_q8_0_f32_kq_gen = nullptr;
+     cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128 = nullptr;
+@@ -2048,6 +2049,7 @@ struct ggml_backend_opencl_context {
+     int q80_dp4a_ts_narrow  = 32;   // == 32 disables the split
+     int q80_dp4a_narrow_max = 16;   // widest ne1 routed to the narrow tile
+     cl_kernel kernel_gemv_noshuffle_q8_0_f32;
++    cl_kernel kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk = nullptr; // small-M 2..8-column int8 split-K GEMV
+     cl_kernel kernel_gemv_noshuffle_q8_0_f32_splitk;  // split-K across WGs (small-M decode)
+     cl_kernel kernel_gemm_noshuffle_q1_0_f32;
+     cl_kernel kernel_gemv_noshuffle_q1_0_f32;
+@@ -6549,6 +6551,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+             if (err != CL_SUCCESS) { backend_ctx->kernel_q8mc_quant_act = nullptr; }
+             backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_mul_mv_q8_0_q8a_dp4a_mc", &err);
+             if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc = nullptr; }
++            backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc_lds = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_mul_mv_q8_0_q8a_dp4a_mc_lds", &err);
++            if (err != CL_SUCCESS) {
++                GGML_LOG_WARN("ggml_opencl: kernel_mul_mv_q8_0_q8a_dp4a_mc_lds unavailable (err %d)\n", err);
++                backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc_lds = nullptr;
++            }
+             backend_ctx->kernel_fa_q8_d256_g8_dec = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_fa_q8_d256_g8_dec", &err);
+             if (err != CL_SUCCESS) {
+                 GGML_LOG_WARN("ggml_opencl: kernel_fa_q8_d256_g8_dec unavailable (err %d)\n", err);
+@@ -9525,6 +9532,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+ 
+         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q8_0_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q8_0_f32", &err), err));
+         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q8_0_f32_splitk = clCreateKernel(prog, "kernel_gemv_noshuffle_q8_0_f32_splitk", &err), err));
++        backend_ctx->kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk = clCreateKernel(prog, "kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk", &err);
++        if (err != CL_SUCCESS) {
++            GGML_LOG_WARN("ggml_opencl: kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk unavailable (err %d)\n", err);
++            backend_ctx->kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk = nullptr;
++        }
+         CL_CHECK(clReleaseProgram(prog));
+         GGML_LOG_CONT(".");
+     }
+@@ -38794,6 +38806,82 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
+             return;
+         }
+ 
++        // Small-M speculative-verify widths (M <= 2048, N 2..8): the cooperative-K GEMM below
++        // tiles 4 rows per lane into 64-lane work-groups, so M = 512 is two work-groups on a
++        // 16-CU X2. int8 split-K GEMV instead: weights read once, 8 K slices, then the split-K
++        // reduce over M * N outputs. Opt out with GGML_OPENCL_Q8_NS_MC_SPLITK=0.
++        static const bool q8_ns_mc_splitk_off = ggml_cl_env_flag_zero("GGML_OPENCL_Q8_NS_MC_SPLITK");
++        if (!q8_ns_mc_splitk_off && N >= 2 && N <= 8 && M <= 2048 && M % 64 == 0 &&
++            src1->ne[2] == 1 && src1->ne[3] == 1 && dst->nb[1] == (size_t) M * sizeof(float) &&
++            backend_ctx->kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk != nullptr &&
++            backend_ctx->kernel_q8mc_quant_act != nullptr &&
++            backend_ctx->kernel_gemv_splitk_reduce_f32 != nullptr) {
++            cl_mem q_img = nullptr;
++            img_fmt = { CL_R, CL_UNSIGNED_INT32};
++            memset(&img_desc, 0, sizeof(img_desc));
++            img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
++            img_desc.image_width = (size_t) M * K / 4;
++            img_desc.buffer = extra0_q8_0->q;
++            CL_CHECK((q_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
++
++            const int nbk  = K / 32;
++            const int ncol = N;
++            backend_ctx->prealloc_q8mc_qa.allocate(context, (size_t) ncol * K);
++            backend_ctx->prealloc_q8mc_da.allocate(context, (size_t) ncol * nbk * sizeof(float));
++            cl_mem qa = backend_ctx->prealloc_q8mc_qa.buffer;
++            cl_mem da = backend_ctx->prealloc_q8mc_da.buffer;
++            const cl_ulong nb11_ul = src1->nb[1];
++            cl_kernel kq = backend_ctx->kernel_q8mc_quant_act;
++            CL_CHECK(clSetKernelArg(kq, 0, sizeof(cl_mem),   &extra1->data_device));
++            CL_CHECK(clSetKernelArg(kq, 1, sizeof(cl_ulong), &offset1));
++            CL_CHECK(clSetKernelArg(kq, 2, sizeof(cl_ulong), &nb11_ul));
++            CL_CHECK(clSetKernelArg(kq, 3, sizeof(int),      &K));
++            CL_CHECK(clSetKernelArg(kq, 4, sizeof(int),      &ncol));
++            CL_CHECK(clSetKernelArg(kq, 5, sizeof(cl_mem),   &qa));
++            CL_CHECK(clSetKernelArg(kq, 6, sizeof(cl_mem),   &da));
++            size_t gq[3] = { (size_t) CEIL_DIV(ncol * nbk, 64) * 64, 1, 1 };
++            size_t lq[3] = { 64, 1, 1 };
++            backend_ctx->enqueue_ndrange_kernel(kq, 3, gq, lq, dst);
++
++            static const int ns_ksplit = []{
++                const char * e = getenv("GGML_OPENCL_Q8_NS_MC_KSPLIT");
++                const int v = (e && e[0]) ? atoi(e) : 8;
++                return (v >= 1 && v <= 32) ? v : 8;
++            }();
++            const int nsg = 4;
++            // at least two K-blocks per (slice, subgroup): K = 512 has only 16 blocks
++            const int ksplit = std::max(1, std::min(ns_ksplit, nbk / (nsg * 2)));
++            backend_ctx->prealloc_splitk_partial.allocate(context, (size_t) ksplit * ncol * M * sizeof(float));
++            cl_mem partial = backend_ctx->prealloc_splitk_partial.buffer;
++
++            cl_kernel kd = backend_ctx->kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk;
++            CL_CHECK(clSetKernelArg(kd, 0, sizeof(cl_mem), &q_img));
++            CL_CHECK(clSetKernelArg(kd, 1, sizeof(cl_mem), &extra0_q8_0->d));
++            CL_CHECK(clSetKernelArg(kd, 2, sizeof(cl_mem), &qa));
++            CL_CHECK(clSetKernelArg(kd, 3, sizeof(cl_mem), &da));
++            CL_CHECK(clSetKernelArg(kd, 4, sizeof(cl_mem), &partial));
++            CL_CHECK(clSetKernelArg(kd, 5, sizeof(int),    &K));
++            CL_CHECK(clSetKernelArg(kd, 6, sizeof(int),    &M));
++            CL_CHECK(clSetKernelArg(kd, 7, sizeof(int),    &ncol));
++            size_t ld[3] = { 64, (size_t) nsg, 1 };
++            size_t gd[3] = { (size_t) CEIL_DIV(M, 64) * 64, (size_t) (nsg * ksplit), 1 };
++            backend_ctx->enqueue_ndrange_kernel(kd, 3, gd, ld, dst);
++
++            const int mn = M * ncol;
++            cl_kernel kr = backend_ctx->kernel_gemv_splitk_reduce_f32;
++            CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &partial));
++            CL_CHECK(clSetKernelArg(kr, 1, sizeof(cl_mem),   &extrad->data_device));
++            CL_CHECK(clSetKernelArg(kr, 2, sizeof(cl_ulong), &offsetd));
++            CL_CHECK(clSetKernelArg(kr, 3, sizeof(cl_int),   &mn));
++            CL_CHECK(clSetKernelArg(kr, 4, sizeof(cl_int),   &ksplit));
++            size_t lr[3] = { 64, 1, 1 };
++            size_t gr[3] = { (size_t) CEIL_DIV(mn, 64) * 64, 1, 1 };
++            backend_ctx->enqueue_ndrange_kernel(kr, 3, gr, lr, dst);
++
++            CL_CHECK(clReleaseMemObject(q_img));
++            return;
++        }
++
+         // Cooperative-K for the verify band, decided BEFORE the bin kernel so the
+         // narrow widths can opt out of it. The ILA binary kernel below returns
+         // unconditionally, which used to make the cooperative-K gate dead code on
+@@ -47909,7 +47997,16 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                 size_t gq[3] = { (size_t) CEIL_DIV(ncol * nbk, 64) * 64, 1, 1 };
+                 size_t lq[3] = { 64, 1, 1 };
+                 backend_ctx->enqueue_ndrange_kernel(kq, 3, gq, lq, dst);
+-                cl_kernel km = backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc;
++                // local-memory activation variant: activations fit (ncol * K <= 16 KB)
++                static const int mc_lds_nsg = []{
++                    const char * e = getenv("GGML_OPENCL_Q8_MC_LDS_NSG");
++                    const int v = (e && e[0]) ? atoi(e) : 8;
++                    return (v >= 0 && v <= 16) ? v : 8;
++                }();
++                const bool use_lds = mc_lds_nsg > 0 && backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc_lds != nullptr &&
++                                     (size_t) ncol * ne00 <= 16384;
++                cl_kernel km = use_lds ? backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc_lds
++                                       : backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc;
+                 CL_CHECK(clSetKernelArg(km,  0, sizeof(cl_mem),   &extra0_q8_0->q));
+                 CL_CHECK(clSetKernelArg(km,  1, sizeof(cl_mem),   &extra0_q8_0->d));
+                 CL_CHECK(clSetKernelArg(km,  2, sizeof(cl_mem),   &qa));
+@@ -47921,9 +48018,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                 CL_CHECK(clSetKernelArg(km,  8, sizeof(cl_ulong), &nb01));
+                 CL_CHECK(clSetKernelArg(km,  9, sizeof(int),      &ne0));
+                 CL_CHECK(clSetKernelArg(km, 10, sizeof(int),      &ncol));
+-                const int rows_per_wg = 2 * 4;  // N_SG_Q8_0 * N_R0_Q8_0 (Adreno)
+-                size_t gm[3] = { (size_t) CEIL_DIV(ne01, rows_per_wg) * 64, 2, 1 };
+-                size_t lm[3] = { 64, 2, 1 };
++                const int nsg = use_lds ? mc_lds_nsg : 2;
++                const int rows_per_wg = nsg * 4;  // subgroups * MC_R0 (Adreno)
++                size_t gm[3] = { (size_t) CEIL_DIV(ne01, rows_per_wg) * 64, (size_t) nsg, 1 };
++                size_t lm[3] = { 64, (size_t) nsg, 1 };
+                 backend_ctx->enqueue_ndrange_kernel(km, 3, gm, lm, dst);
+                 return;
+             }
+diff --git a/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q8_0_f32.cl b/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q8_0_f32.cl
+index c97f86d..ba976de 100644
+--- a/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q8_0_f32.cl
++++ b/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q8_0_f32.cl
+@@ -118,6 +118,98 @@
+     elem = (char)((bits8.s7 & 0xFF000000) >> 24); \
+     total_sums += convert_int(elem) * scale * shared_y; \
+ 
++// ============================================================================
++// Multi-column (2..8) int8 split-K GEMV for speculative-verify batches on small-M
++// weights (M <= 1024), where the cooperative-K GEMM fills only M/256 work-groups.
++// Same transposed weight layout as the base kernel; activations quantized per
++// 32-block by kernel_q8mc_quant_act (qa: [ncol][K] int8, da: [ncol][K/32] float).
++// Each (K slice, subgroup) reduces a disjoint set of blocks into
++// partial[kslice][c][row]; kernel_gemv_splitk_reduce_f32 sums the slices over
++// M * ncol outputs. No subgroup builtins here.
++// ============================================================================
++#ifdef cl_khr_integer_dot_product
++#pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
++#define NS_MC_MAX 8
++#ifdef ADRENO_GPU
++REQD_SUBGROUP_SIZE_64
++#endif
++__kernel void kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk(
++        __read_only  image1d_buffer_t src0_q,
++        global half  * src0_d,
++        global const uint  * qa,
++        global const float * da,
++        global float * partial,                 // [ksplit][ncol][M]
++        int ne00,
++        int ne01,
++        int ncol)
++{
++    const uint groupId = get_local_id(1);
++    const uint nsg     = get_local_size(1);
++    const uint ksplit  = get_num_groups(1);
++    const uint kslice  = get_group_id(1);
++    const uint gid     = get_global_id(0);
++    const uint lid     = get_local_id(0);
++
++    const uint K = ne00;
++    const uint M = ne01;
++    const uint nbk   = K / QK8_0;
++    const uint gid_s = min(gid, M - 1);
++    const uint BS    = 8 * M;
++
++    float total[NS_MC_MAX];
++    #pragma unroll
++    for (int c = 0; c < NS_MC_MAX; ++c) total[c] = 0.0f;
++
++    #pragma unroll 1
++    for (uint k = kslice * nsg + groupId; k < nbk; k += ksplit * nsg) {
++        const uint wb = gid_s + k * BS;
++        const uint w0 = read_imageui(src0_q, wb + M * 0).x;
++        const uint w1 = read_imageui(src0_q, wb + M * 1).x;
++        const uint w2 = read_imageui(src0_q, wb + M * 2).x;
++        const uint w3 = read_imageui(src0_q, wb + M * 3).x;
++        const uint w4 = read_imageui(src0_q, wb + M * 4).x;
++        const uint w5 = read_imageui(src0_q, wb + M * 5).x;
++        const uint w6 = read_imageui(src0_q, wb + M * 6).x;
++        const uint w7 = read_imageui(src0_q, wb + M * 7).x;
++        const float dw = convert_float(src0_d[gid_s + k * M]);
++        #pragma unroll
++        for (int c = 0; c < NS_MC_MAX; ++c) {
++            if (c < ncol) {
++                const uint8 a = vload8(c * nbk + k, qa);
++                int acc = dot_acc_sat_4x8packed_ss_int(w0, a.s0, 0);
++                acc = dot_acc_sat_4x8packed_ss_int(w1, a.s1, acc);
++                acc = dot_acc_sat_4x8packed_ss_int(w2, a.s2, acc);
++                acc = dot_acc_sat_4x8packed_ss_int(w3, a.s3, acc);
++                acc = dot_acc_sat_4x8packed_ss_int(w4, a.s4, acc);
++                acc = dot_acc_sat_4x8packed_ss_int(w5, a.s5, acc);
++                acc = dot_acc_sat_4x8packed_ss_int(w6, a.s6, acc);
++                acc = dot_acc_sat_4x8packed_ss_int(w7, a.s7, acc);
++                total[c] = mad((float) acc, dw * da[c * nbk + k], total[c]);
++            }
++        }
++    }
++
++    __local float red[64 * 7 * NS_MC_MAX];
++    if (groupId > 0) {
++        #pragma unroll
++        for (int c = 0; c < NS_MC_MAX; ++c) {
++            if (c < ncol) red[(64 * (groupId - 1) + lid) * NS_MC_MAX + c] = total[c];
++        }
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++    if (groupId == 0 && gid < M) {
++        #pragma unroll
++        for (int c = 0; c < NS_MC_MAX; ++c) {
++            if (c < ncol) {
++                float v = total[c];
++                for (uint i = 0; i + 1 < nsg; ++i) v += red[(64 * i + lid) * NS_MC_MAX + c];
++                partial[((ulong) kslice * ncol + c) * M + gid] = v;
++            }
++        }
++    }
++}
++#endif // cl_khr_integer_dot_product
++
+ // ============================================================================
+ // Split-K variant for small-M decode GEMVs.
+ // ----------------------------------------------------------------------------
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
+index 084352e..42f480e 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
+@@ -376,6 +376,9 @@ kernel void kernel_mul_mv_q8_0_f32_flat_mc(
+ #ifdef cl_khr_integer_dot_product
+ #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
+ #define Q8MC_MAXC 8
++#ifndef MC_R0
++#define MC_R0 4
++#endif
+ 
+ kernel void kernel_q8mc_quant_act(
+     global const char * src1, ulong offset1, ulong nb11,
+@@ -419,12 +422,12 @@ kernel void kernel_mul_mv_q8_0_q8a_dp4a_mc(
+     const int nb = ne00/QK8_0;
+     const int r0 = get_group_id(0);
+ 
+-    int first_row = (r0*N_SG_Q8_0 + get_sub_group_id()) * N_R0_Q8_0;
+-    first_row = min(first_row, max(ne01 - N_R0_Q8_0, 0));
++    int first_row = (r0*N_SG_Q8_0 + get_sub_group_id()) * MC_R0;
++    first_row = min(first_row, max(ne01 - MC_R0, 0));
+ 
+-    global char * ax[N_R0_Q8_0];
+-    global half * ad[N_R0_Q8_0];
+-    for (int r = 0; r < N_R0_Q8_0; r++) {
++    global char * ax[MC_R0];
++    global half * ad[MC_R0];
++    for (int r = 0; r < MC_R0; r++) {
+         const ulong off = ((ulong)(first_row + r)*nb01)/34;
+         ax[r] = src0_q + off*QK8_0;
+         ad[r] = (global half *)((global char *)src0_d + off*sizeof(half));
+@@ -433,21 +436,104 @@ kernel void kernel_mul_mv_q8_0_q8a_dp4a_mc(
+     const short ix = get_sub_group_local_id()/4;
+     const short il = get_sub_group_local_id()%4;
+ 
+-    float sumf[Q8MC_MAXC][N_R0_Q8_0];
++    float sumf[Q8MC_MAXC][MC_R0];
+     for (int c = 0; c < Q8MC_MAXC; c++)
+-        for (int r = 0; r < N_R0_Q8_0; r++) sumf[c][r] = 0.0f;
++        for (int r = 0; r < MC_R0; r++) sumf[c][r] = 0.0f;
+ 
+     for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/4) {
+-        uint2 w[N_R0_Q8_0];
+-        float dw[N_R0_Q8_0];
+-        for (int r = 0; r < N_R0_Q8_0; r++) {
++        uint2 w[MC_R0];
++        float dw[MC_R0];
++        for (int r = 0; r < MC_R0; r++) {
+             w[r]  = as_uint2(vload8(0, ax[r] + ib*QK8_0 + il*NB_Q8_0));
+             dw[r] = ad[r][ib];
+         }
+-        for (int c = 0; c < ncol; c++) {
++        #pragma unroll
++        for (int c = 0; c < Q8MC_MAXC; c++) {
++            if (c >= ncol) break;
+             const uint2 a  = as_uint2(vload8(0, qa + (ulong)c*ne00 + ib*QK8_0 + il*NB_Q8_0));
+             const float dc = da[c*nb + ib];
+-            for (int r = 0; r < N_R0_Q8_0; r++) {
++            for (int r = 0; r < MC_R0; r++) {
++                int s = dot_acc_sat_4x8packed_ss_int(w[r].x, a.x, 0);
++                s     = dot_acc_sat_4x8packed_ss_int(w[r].y, a.y, s);
++                sumf[c][r] += (float)s * (dw[r] * dc);
++            }
++        }
++    }
++
++    #pragma unroll
++    for (int c = 0; c < Q8MC_MAXC; c++) {
++        if (c >= ncol) break;
++        global float * dst_f32 = (global float *) dst + (ulong)c*ne0;
++        for (int r = 0; r < MC_R0; r++) {
++            const float tot = sub_group_reduce_add(sumf[c][r]);
++            if (get_sub_group_local_id() == 0 && first_row + r < ne01) dst_f32[first_row + r] = tot;
++        }
++    }
++}
++
++// Same as kernel_mul_mv_q8_0_q8a_dp4a_mc, but the quantized activations (ncol * K bytes) are
++// staged once per work-group in local memory and shared by its MC_NSG subgroups. With 5 columns
++// a subgroup otherwise reads 10 KB of activations for 8 KB of weights (lm_head: 248320 rows).
++#define Q8MC_LDS_BYTES 16384
++#ifdef ADRENO_GPU
++REQD_SUBGROUP_SIZE_64
++#endif
++kernel void kernel_mul_mv_q8_0_q8a_dp4a_mc_lds(
++    global char  * src0_q,
++    global half  * src0_d,
++    global char  * qa,
++    global float * da,
++    global char  * dst,
++    ulong          offsetd,
++    int            ne00,
++    int            ne01,
++    ulong          nb01,
++    int            ne0,
++    int            ncol)
++{
++    local uint  qa_l[Q8MC_LDS_BYTES / 4];
++    local float da_l[Q8MC_LDS_BYTES / QK8_0];
++
++    dst = (global char*)((global char*)dst + offsetd);
++    const int nb = ne00/QK8_0;
++
++    const int lsz  = get_local_size(0) * get_local_size(1);
++    const int lidf = get_local_id(1) * get_local_size(0) + get_local_id(0);
++    for (int i = lidf; i < ncol * ne00 / 4; i += lsz) qa_l[i] = ((global const uint *) qa)[i];
++    for (int i = lidf; i < ncol * nb; i += lsz)       da_l[i] = da[i];
++    barrier(CLK_LOCAL_MEM_FENCE);
++
++    int first_row = (get_group_id(0) * get_local_size(1) + get_local_id(1)) * MC_R0;
++    first_row = min(first_row, max(ne01 - MC_R0, 0));
++
++    global char * ax[MC_R0];
++    global half * ad[MC_R0];
++    for (int r = 0; r < MC_R0; r++) {
++        const ulong off = ((ulong)(first_row + r)*nb01)/34;
++        ax[r] = src0_q + off*QK8_0;
++        ad[r] = (global half *)((global char *)src0_d + off*sizeof(half));
++    }
++
++    const short ix = get_sub_group_local_id()/4;
++    const short il = get_sub_group_local_id()%4;
++
++    float sumf[Q8MC_MAXC][MC_R0];
++    for (int c = 0; c < Q8MC_MAXC; c++)
++        for (int r = 0; r < MC_R0; r++) sumf[c][r] = 0.0f;
++
++    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/4) {
++        uint2 w[MC_R0];
++        float dw[MC_R0];
++        for (int r = 0; r < MC_R0; r++) {
++            w[r]  = as_uint2(vload8(0, ax[r] + ib*QK8_0 + il*NB_Q8_0));
++            dw[r] = ad[r][ib];
++        }
++        #pragma unroll
++        for (int c = 0; c < Q8MC_MAXC; c++) {
++            if (c >= ncol) break;
++            const uint2 a  = vload2(0, qa_l + (c*ne00 + ib*QK8_0 + il*NB_Q8_0) / 4);
++            const float dc = da_l[c*nb + ib];
++            for (int r = 0; r < MC_R0; r++) {
+                 int s = dot_acc_sat_4x8packed_ss_int(w[r].x, a.x, 0);
+                 s     = dot_acc_sat_4x8packed_ss_int(w[r].y, a.y, s);
+                 sumf[c][r] += (float)s * (dw[r] * dc);
+@@ -455,9 +541,11 @@ kernel void kernel_mul_mv_q8_0_q8a_dp4a_mc(
+         }
+     }
+ 
+-    for (int c = 0; c < ncol; c++) {
++    #pragma unroll
++    for (int c = 0; c < Q8MC_MAXC; c++) {
++        if (c >= ncol) break;
+         global float * dst_f32 = (global float *) dst + (ulong)c*ne0;
+-        for (int r = 0; r < N_R0_Q8_0; r++) {
++        for (int r = 0; r < MC_R0; r++) {
+             const float tot = sub_group_reduce_add(sumf[c][r]);
+             if (get_sub_group_local_id() == 0 && first_row + r < ne01) dst_f32[first_row + r] = tot;
+         }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index ee84aaf..622304a 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10546,6 +10546,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, 256, {2, 3}, {1, 1}, {0, 1, 3, 2}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, 256, {2, 3}, {1, 1}, {0, 3, 2, 1}));
+ 
++    // Qwen3.5/3.6 MoE speculative-verify batches (2..8 tokens), q6_K experts: gate/up and down shapes
++    for (int n : {2, 3, 5, 8}) {
++        for (bool b : {false, true}) {
++            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 32, 8, b, 512, n, 2048));
++            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 32, 8, b, 2048, n, 512));
++        }
++    }
++
+     // token-tile boundary coverage. With n_used == n_mats every token routes to every expert, so
+     // each expert receives exactly n rows, with no dependence on the random draw. mul_mm_id is used
+     // from 32 tokens up: n = 32, 33, 47, 48, 49 reach it, leaving a last tile of 32, 1, 15, 16 and
+@@ -11853,6 +11861,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // Qwen3.6-35B-A3B speculative verify: lm_head (q8_0, 248320 x 2048) and the small dense
++    // projections, at 1 and 5 columns
++    for (int n : {1, 5}) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, n, 2048, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, n, 2048, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, n, 512, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, n, 2048, {1, 1}, {1, 1}));
++    }
++
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+-- 
+2.55.0.windows.5
+

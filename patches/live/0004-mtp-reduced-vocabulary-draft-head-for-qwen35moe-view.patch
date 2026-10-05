@@ -1,0 +1,67 @@
+From 29de3d1c1f98d518c257a2c0f7db4ee500b53d0e Mon Sep 17 00:00:00 2001
+From: snap-pea <snap-pea@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 08:30:26 -0400
+Subject: [PATCH 04/19] mtp: reduced-vocabulary draft head for qwen35moe;
+ view-aware Q8_0 dispatch
+
+The MTP draft step projected onto all 248320 vocab rows (4.2 ms per draft, 3 per N=3 round).
+Draft only the first LLAMA_MTP_DRAFT_VOCAB rows (default 65536, 0 = full) and zero-pad;
+the target still verifies with the full head, so outputs are unchanged.
+Q8_0 dispatch now judges a row view by its view_src (layout is chosen at load from the
+parent), which previously sent sub-65536-row views to the transposed-layout GEMV.
+X2-90, N=3 warmed: 30.9/37.5 -> 36.7/40.6 tok/s (plain 32.4/32.7). K=16k/32k lose acceptance.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-opencl/ggml-opencl.cpp |  4 +++-
+ src/models/qwen35moe.cpp             | 18 +++++++++++++++++-
+ 2 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 481f38f..474dfc0 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -44731,8 +44731,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+         }
+ 
+         // q8_0 x fp32
++        // The layout was chosen at load from the parent weight, so a row view (e.g. the MTP
++        // reduced-vocabulary draft head) must be judged by its view_src, not its own shape.
+         if (src0t == GGML_TYPE_Q8_0 && src1t == GGML_TYPE_F32 &&
+-            enable_adreno_trans_weight(backend_ctx, src0)) {
++            enable_adreno_trans_weight(backend_ctx, src0->view_src ? src0->view_src : src0)) {
+                 ggml_cl_mul_mat_q8_0_f32_adreno(backend, src0, src1, dst);
+                 return;
+         }
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index bdf7726..93143f3 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -733,7 +733,23 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
+-    cur = build_lora_mm(head_w, cur, head_s);
++
++    // Reduced-vocabulary draft head (LLAMA_MTP_DRAFT_VOCAB=K, default 65536, 0 = full head): score only the first K
++    // vocabulary rows (BPE ids are roughly frequency-ordered) and zero-pad back to n_vocab.
++    // Drafts are only proposals - the target verifies with the full head - so this trades a
++    // little acceptance for skipping most of the 248k-row projection on every draft step.
++    static const int64_t draft_vocab = [] {
++        const char * e = getenv("LLAMA_MTP_DRAFT_VOCAB");
++        return e ? (int64_t) atoll(e) : (int64_t) 65536; // measured best on X2-90 (see commit)
++    }();
++    const int64_t n_vocab_head = head_w->ne[1];
++    if (draft_vocab > 0 && draft_vocab < n_vocab_head && head_s == nullptr) {
++        ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w, head_w->ne[0], draft_vocab, head_w->nb[1], 0);
++        cur = ggml_mul_mat(ctx0, head_sub, cur);
++        cur = ggml_pad(ctx0, cur, (int) (n_vocab_head - draft_vocab), 0, 0, 0);
++    } else {
++        cur = build_lora_mm(head_w, cur, head_s);
++    }
+     cb(cur, "result_output", -1);
+ 
+     res->t_logits = cur;
+-- 
+2.55.0.windows.5
+

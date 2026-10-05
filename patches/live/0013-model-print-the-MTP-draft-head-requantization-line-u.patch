@@ -1,0 +1,27 @@
+From c25898df3092e6f227503d70e285bd0e9bb22e20 Mon Sep 17 00:00:00 2001
+From: snap-pea <snap-pea@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 05:46:19 -0400
+Subject: [PATCH 13/19] model: print the MTP draft-head requantization line
+ unconditionally
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-model.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index ec430b9..bb9f897 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1976,7 +1976,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             std::vector<ggml_backend_buffer_ptr> bv;
+             bv.emplace_back(buf);
+             pimpl->ctxs_bufs.emplace_back(ggml_context_ptr(cx), std::move(bv));
+-            LLAMA_LOG_INFO("%s: MTP draft head: %lld rows requantized q8_0 -> q4_0 (%.1f MiB)\n", __func__,
++            fprintf(stderr, "%s: MTP draft head: %lld rows requantized q8_0 -> q4_0 (%.1f MiB)\n", __func__,
+                     (long long) nv, ggml_nbytes(t) / 1048576.0);
+         } else {
+             ggml_free(cx);
+-- 
+2.55.0.windows.5
+

@@ -1,0 +1,215 @@
+From 99800926447e6f6f3aec1697d649ec251639bb9d Mon Sep 17 00:00:00 2001
+From: snap-pea <snap-pea@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 09:10:08 -0400
+Subject: [PATCH 05/19] ggml : int8 (dp4a) multi-column Q8_0 verify GEMV
+
+Quantize the 2..8 verify activation columns per 32-block and use packed int8 dots
+against the flat Q8_0 weights (the float multi-column kernel is ALU-bound on the
+248k-row LM head). Opt out with GGML_OPENCL_Q8_MC_DP4A=0.
+X2-90 MTP N=5 p-min 0.6: 38.3/47.0 -> 39.5/47.8 tok/s; output coherent.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-opencl/ggml-opencl.cpp          |  56 ++++++++++
+ .../kernels/mul_mv_q8_0_f32_flat.cl           | 100 ++++++++++++++++++
+ 2 files changed, 156 insertions(+)
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 474dfc0..084994e 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1146,6 +1146,8 @@ struct ggml_backend_opencl_context {
+     ggml_cl_buffer prealloc_act_trans;
+     ggml_cl_buffer prealloc_splitk_partial;  // [ksplit * M] partials for split-K GEMV
+     // q8_1-quantized reordered MoE activations for the dp4a prefill GEMM.
++    ggml_cl_buffer prealloc_q8mc_qa;  // dp4a verify GEMV: int8 activations [ncol * ne00]
++    ggml_cl_buffer prealloc_q8mc_da;  // dp4a verify GEMV: block scales     [ncol * ne00/32] (float)
+     ggml_cl_buffer prealloc_moe_qa;   // int8 quants  [tok_slots * ne00]
+     ggml_cl_buffer prealloc_topk_val;  // TOP_K stage-1 candidate values  [nrows * ncand]
+     ggml_cl_buffer prealloc_topk_idx;  // TOP_K stage-1 candidate columns [nrows * ncand]
+@@ -1591,6 +1593,8 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_mul_mv_q8_0_f32, kernel_mul_mv_q8_0_f32_flat;
+     cl_kernel kernel_mul_mv_q8_0_f32_flat_mc = nullptr;
+     cl_kernel kernel_mul_mv_q8_0_f32_flat_mc8 = nullptr;
++    cl_kernel kernel_q8mc_quant_act = nullptr;           // dp4a verify GEMV: activation quantizer
++    cl_kernel kernel_mul_mv_q8_0_q8a_dp4a_mc = nullptr;  // dp4a verify GEMV (2..8 columns)
+     cl_kernel kernel_mul_mat_q8_0_f32_kq_gen = nullptr;
+     cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128 = nullptr;
+     cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128_img = nullptr;
+@@ -6535,6 +6539,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         cl_program program_mc8 = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts + " -DN_COLS_Q8_0_MC=8");
+         CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc8 = clCreateKernel(program_mc8, "kernel_mul_mv_q8_0_f32_flat_mc", &err), err));
+         CL_CHECK(clReleaseProgram(program_mc8));
++        if (backend_ctx->has_integer_dot_product) {
++            backend_ctx->kernel_q8mc_quant_act = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_q8mc_quant_act", &err);
++            if (err != CL_SUCCESS) { backend_ctx->kernel_q8mc_quant_act = nullptr; }
++            backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_mul_mv_q8_0_q8a_dp4a_mc", &err);
++            if (err != CL_SUCCESS) { backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc = nullptr; }
++        }
+         GGML_LOG_CONT(".");
+     }
+ 
+@@ -47850,6 +47860,52 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+         }
+         case GGML_TYPE_Q8_0: {
+ #ifdef GGML_OPENCL_SOA_Q
++            // int8 (dp4a) multi-column verify GEMV: quantize the 2..8 activation columns
++            // per 32-block, then packed int8 dots. Opt out with GGML_OPENCL_Q8_MC_DP4A=0.
++            static const bool q8_mc_dp4a_on = []{
++                const char * e = getenv("GGML_OPENCL_Q8_MC_DP4A");
++                return !(e && e[0] == '0');
++            }();
++            if (q8_mc_dp4a_on && ne11 >= 2 && ne11 <= 8 && ne11 == ne1 && ne12 == 1 && ne02 == 1 &&
++                backend_ctx->gpu_family == ADRENO &&
++                backend_ctx->kernel_q8mc_quant_act != nullptr &&
++                backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc != nullptr) {
++                const int ncol = ne11;
++                const int nbk  = ne00 / 32;
++                backend_ctx->prealloc_q8mc_qa.allocate(backend_ctx->context, (size_t) ncol * ne00);
++                backend_ctx->prealloc_q8mc_da.allocate(backend_ctx->context, (size_t) ncol * nbk * sizeof(float));
++                cl_mem qa = backend_ctx->prealloc_q8mc_qa.buffer;
++                cl_mem da = backend_ctx->prealloc_q8mc_da.buffer;
++                cl_ulong nb11_ul = nb11;
++                cl_kernel kq = backend_ctx->kernel_q8mc_quant_act;
++                CL_CHECK(clSetKernelArg(kq, 0, sizeof(cl_mem),   &extra1->data_device));
++                CL_CHECK(clSetKernelArg(kq, 1, sizeof(cl_ulong), &offset1));
++                CL_CHECK(clSetKernelArg(kq, 2, sizeof(cl_ulong), &nb11_ul));
++                CL_CHECK(clSetKernelArg(kq, 3, sizeof(int),      &ne00));
++                CL_CHECK(clSetKernelArg(kq, 4, sizeof(int),      &ncol));
++                CL_CHECK(clSetKernelArg(kq, 5, sizeof(cl_mem),   &qa));
++                CL_CHECK(clSetKernelArg(kq, 6, sizeof(cl_mem),   &da));
++                size_t gq[3] = { (size_t) CEIL_DIV(ncol * nbk, 64) * 64, 1, 1 };
++                size_t lq[3] = { 64, 1, 1 };
++                backend_ctx->enqueue_ndrange_kernel(kq, 3, gq, lq, dst);
++                cl_kernel km = backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc;
++                CL_CHECK(clSetKernelArg(km,  0, sizeof(cl_mem),   &extra0_q8_0->q));
++                CL_CHECK(clSetKernelArg(km,  1, sizeof(cl_mem),   &extra0_q8_0->d));
++                CL_CHECK(clSetKernelArg(km,  2, sizeof(cl_mem),   &qa));
++                CL_CHECK(clSetKernelArg(km,  3, sizeof(cl_mem),   &da));
++                CL_CHECK(clSetKernelArg(km,  4, sizeof(cl_mem),   &extrad->data_device));
++                CL_CHECK(clSetKernelArg(km,  5, sizeof(cl_ulong), &offsetd));
++                CL_CHECK(clSetKernelArg(km,  6, sizeof(int),      &ne00));
++                CL_CHECK(clSetKernelArg(km,  7, sizeof(int),      &ne01));
++                CL_CHECK(clSetKernelArg(km,  8, sizeof(cl_ulong), &nb01));
++                CL_CHECK(clSetKernelArg(km,  9, sizeof(int),      &ne0));
++                CL_CHECK(clSetKernelArg(km, 10, sizeof(int),      &ncol));
++                const int rows_per_wg = 2 * 4;  // N_SG_Q8_0 * N_R0_Q8_0 (Adreno)
++                size_t gm[3] = { (size_t) CEIL_DIV(ne01, rows_per_wg) * 64, 2, 1 };
++                size_t lm[3] = { 64, 2, 1 };
++                backend_ctx->enqueue_ndrange_kernel(km, 3, gm, lm, dst);
++                return;
++            }
+             if (ne11 >= 2 && ne11 <= 4 && ne11 == ne1 &&
+                 backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc != nullptr) {
+                 kernel = backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc;
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
+index a8a1592..930eeaa 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
+@@ -364,3 +364,103 @@ kernel void kernel_mul_mv_q8_0_f32_flat_mc(
+         }
+     }
+ }
++
++// ============================================================================
++// int8 (dp4a) multi-column verify GEMV for flat Q8_0 weights (MTP / speculative
++// verify, 2..8 columns). The float multi-column kernel above is ALU-bound on the
++// 248k-row LM head; here activations are quantized per 32-value block to int8
++// (kernel_q8mc_quant_act) and each row block is a pair of packed int8 dot
++// products. Same tiling as the float kernel: 4 rows per subgroup, lanes split
++// as 16 (blocks) x 4 (8-byte chunks).
++// ============================================================================
++#ifdef cl_khr_integer_dot_product
++#pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
++#define Q8MC_MAXC 8
++
++kernel void kernel_q8mc_quant_act(
++    global const char * src1, ulong offset1, ulong nb11,
++    int K, int ncol,
++    global char  * qa,    // [ncol][K]
++    global float * da)    // [ncol][K/32]
++{
++    const int nbk = K / QK8_0;
++    const int gid = get_global_id(0);
++    if (gid >= ncol * nbk) return;
++    const int col = gid / nbk;
++    const int b   = gid - col * nbk;
++    global const float * x = (global const float *)(src1 + offset1 + col*nb11) + b*QK8_0;
++    float v[QK8_0];
++    float amax = 0.0f;
++    for (int i = 0; i < QK8_0; i++) { v[i] = x[i]; amax = fmax(amax, fabs(v[i])); }
++    const float d  = amax / 127.0f;
++    const float id = amax > 0.0f ? 127.0f / amax : 0.0f;
++    global char * q = qa + (ulong)col*K + b*QK8_0;
++    for (int i = 0; i < QK8_0; i++) q[i] = (char) rint(v[i] * id);
++    da[col*nbk + b] = d;
++}
++
++#ifdef ADRENO_GPU
++REQD_SUBGROUP_SIZE_64
++#endif
++kernel void kernel_mul_mv_q8_0_q8a_dp4a_mc(
++    global char  * src0_q,
++    global half  * src0_d,
++    global char  * qa,
++    global float * da,
++    global char  * dst,
++    ulong          offsetd,
++    int            ne00,
++    int            ne01,
++    ulong          nb01,
++    int            ne0,
++    int            ncol)
++{
++    dst = (global char*)((global char*)dst + offsetd);
++    const int nb = ne00/QK8_0;
++    const int r0 = get_group_id(0);
++
++    int first_row = (r0*N_SG_Q8_0 + get_sub_group_id()) * N_R0_Q8_0;
++    first_row = min(first_row, max(ne01 - N_R0_Q8_0, 0));
++
++    global char * ax[N_R0_Q8_0];
++    global half * ad[N_R0_Q8_0];
++    for (int r = 0; r < N_R0_Q8_0; r++) {
++        const ulong off = ((ulong)(first_row + r)*nb01)/34;
++        ax[r] = src0_q + off*QK8_0;
++        ad[r] = (global half *)((global char *)src0_d + off*sizeof(half));
++    }
++
++    const short ix = get_sub_group_local_id()/4;
++    const short il = get_sub_group_local_id()%4;
++
++    float sumf[Q8MC_MAXC][N_R0_Q8_0];
++    for (int c = 0; c < Q8MC_MAXC; c++)
++        for (int r = 0; r < N_R0_Q8_0; r++) sumf[c][r] = 0.0f;
++
++    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/4) {
++        uint2 w[N_R0_Q8_0];
++        float dw[N_R0_Q8_0];
++        for (int r = 0; r < N_R0_Q8_0; r++) {
++            w[r]  = as_uint2(vload8(0, ax[r] + ib*QK8_0 + il*NB_Q8_0));
++            dw[r] = ad[r][ib];
++        }
++        for (int c = 0; c < ncol; c++) {
++            const uint2 a  = as_uint2(vload8(0, qa + (ulong)c*ne00 + ib*QK8_0 + il*NB_Q8_0));
++            const float dc = da[c*nb + ib];
++            for (int r = 0; r < N_R0_Q8_0; r++) {
++                int s = dot_acc_sat_4x8packed_ss_int(w[r].x, a.x, 0);
++                s     = dot_acc_sat_4x8packed_ss_int(w[r].y, a.y, s);
++                sumf[c][r] += (float)s * (dw[r] * dc);
++            }
++        }
++    }
++
++    for (int c = 0; c < ncol; c++) {
++        global float * dst_f32 = (global float *) dst + (ulong)c*ne0;
++        for (int r = 0; r < N_R0_Q8_0; r++) {
++            const float tot = sub_group_reduce_add(sumf[c][r]);
++            if (get_sub_group_local_id() == 0 && first_row + r < ne01) dst_f32[first_row + r] = tot;
++        }
++    }
++}
++#endif // cl_khr_integer_dot_product
+-- 
+2.55.0.windows.5
+

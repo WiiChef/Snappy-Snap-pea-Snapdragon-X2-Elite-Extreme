@@ -1,0 +1,51 @@
+From 4844dccff9c7614bc744ef1866416076ea3d1a78 Mon Sep 17 00:00:00 2001
+From: snap-pea <snap-pea@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 08:48:00 -0400
+Subject: [PATCH 16/19] opencl: flush the queue every 8 nodes on small graphs
+ so the GPU overlaps host enqueue
+
+An MTP draft step is a ~90-node graph with ~1.5 ms of GPU work; its host enqueue took
+~0.7 ms and the driver started the GPU only at the flush, so the two ran back to back.
+Flushing every 8 nodes on graphs of <= 256 nodes overlaps them; large (GPU-bound) graphs
+are unchanged. GGML_OPENCL_FLUSH_EVERY=N overrides for all graphs (0 = off).
+
+X2-90 Qwen3.6-35B-A3B MTP, agent-prompt bench (2 reps): 43.6 -> 44.35 tok/s;
+greedy acceptance unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-opencl/ggml-opencl.cpp | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index b11e929..4655c64 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -17157,9 +17157,24 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
+     // Feed the queue from a fast core; the driver's own threads were pinned at init.
+     ggml_cl_pin_self pin;
+ 
++    // Small graphs (an MTP draft step: ~90 nodes, ~1.5 ms of GPU work) are host-latency bound: the
++    // driver starts the GPU only when the queue is flushed, so enqueue (~0.7 ms) and execution ran
++    // back to back. Flushing every 8 nodes overlaps them. Large graphs are left alone (they are GPU
++    // bound and the extra flushes cost a little there). GGML_OPENCL_FLUSH_EVERY=N overrides for all
++    // graphs (0 = off).
++    static const int flush_env = []{
++        const char * e = getenv("GGML_OPENCL_FLUSH_EVERY");
++        return (e && e[0]) ? atoi(e) : -1;
++    }();
++    const int flush_every = flush_env >= 0 ? flush_env : (cgraph->n_nodes <= 256 ? 8 : 0);
++
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+ 
++        if (flush_every > 0 && i > 0 && i % flush_every == 0 && !backend_ctx->rec_active) {
++            clFlush(backend_ctx->queue);
++        }
++
+         if (skip_node[i]) {
+             continue;
+         }
+-- 
+2.55.0.windows.5
+

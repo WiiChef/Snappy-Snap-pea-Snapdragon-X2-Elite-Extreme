@@ -1,0 +1,100 @@
+From e445d3290507ed8806e602054dce0c1cb90d3c14 Mon Sep 17 00:00:00 2001
+From: snap-pea <snap-pea@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 05:35:24 -0400
+Subject: [PATCH 12/19] model: optional Q4_0 copy of the MTP draft head
+ (LLAMA_MTP_DRAFT_HEAD_Q4=1)
+
+After loading, the first LLAMA_MTP_DRAFT_VOCAB rows (default 65536) of a Q8_0 output head
+are requantized to Q4_0 into a separate weight buffer and the qwen35moe MTP graph uses it
+for the draft logits. The target lm_head is untouched, so verified output does not change;
+only the drafter's proposals (and so acceptance) can move.
+
+X2-90 Qwen3.6-35B-A3B, agent-prompt bench (temp 0.6): 64k Q8_0 42.6 tok/s (acc 77.8%),
+64k Q4_0 43.1 (77.0%), 96k Q4_0 43.9 (80.5%), 128k Q4_0 42.8 (80.5%).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-model.cpp      | 37 +++++++++++++++++++++++++++++++++++++
+ src/llama-model.h        |  1 +
+ src/models/qwen35moe.cpp |  5 ++++-
+ 3 files changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index ab5e744..ec430b9 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1946,6 +1946,43 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
++    // Optional Q4_0 copy of the MTP draft head rows (LLAMA_MTP_DRAFT_HEAD_Q4=1). Only the drafter
++    // reads it; the target lm_head keeps its own type, so verified output is unchanged.
++    if (const char * e = getenv("LLAMA_MTP_DRAFT_HEAD_Q4"); e && e[0] == '1' && output != nullptr &&
++            output->type == GGML_TYPE_Q8_0 && hparams.n_layer_nextn > 0 && output->buffer != nullptr) {
++        const char * ev = getenv("LLAMA_MTP_DRAFT_VOCAB");
++        const int64_t nv  = std::min<int64_t>(output->ne[1], ev ? atoll(ev) : 65536);
++        const int64_t ne0 = output->ne[0];
++
++        ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, true };
++        ggml_context * cx = ggml_init(ip);
++        ggml_tensor * t = ggml_new_tensor_2d(cx, GGML_TYPE_Q4_0, ne0, nv);
++        ggml_set_name(t, "output_draft.weight");
++        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(cx, ggml_backend_buffer_get_type(output->buffer));
++        if (buf != nullptr) {
++            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++            std::vector<uint8_t> q8(ggml_nbytes(output));
++            ggml_backend_tensor_get(output, q8.data(), 0, q8.size());
++            std::vector<float>   f((size_t) ne0 * 4096);
++            std::vector<uint8_t> q4(ggml_nbytes(t));
++            const auto * tr = ggml_get_type_traits(GGML_TYPE_Q8_0);
++            for (int64_t r0 = 0; r0 < nv; r0 += 4096) {
++                const int64_t nr = std::min<int64_t>(4096, nv - r0);
++                tr->to_float(q8.data() + r0 * output->nb[1], f.data(), nr * ne0);
++                ggml_quantize_chunk(GGML_TYPE_Q4_0, f.data(), q4.data() + r0 * t->nb[1], 0, nr, ne0, nullptr);
++            }
++            ggml_backend_tensor_set(t, q4.data(), 0, q4.size());
++            mtp_draft_head = t;
++            std::vector<ggml_backend_buffer_ptr> bv;
++            bv.emplace_back(buf);
++            pimpl->ctxs_bufs.emplace_back(ggml_context_ptr(cx), std::move(bv));
++            LLAMA_LOG_INFO("%s: MTP draft head: %lld rows requantized q8_0 -> q4_0 (%.1f MiB)\n", __func__,
++                    (long long) nv, ggml_nbytes(t) / 1048576.0);
++        } else {
++            ggml_free(cx);
++        }
++    }
++
+     return true;
+ }
+ 
+diff --git a/src/llama-model.h b/src/llama-model.h
+index a0f9f11..50a1eb7 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -648,6 +648,7 @@ struct llama_model {
+     struct ggml_tensor * output_res_score = nullptr; // kimi-k3: final cross-layer residual mix
+     struct ggml_tensor * output_norm_b   = nullptr;
+     struct ggml_tensor * output          = nullptr;
++    struct ggml_tensor * mtp_draft_head  = nullptr; // optional low-bit copy of the MTP draft head rows (LLAMA_MTP_DRAFT_HEAD_Q4)
+     struct ggml_tensor * output_b        = nullptr;
+     struct ggml_tensor * output_norm_enc = nullptr;
+ 
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 93143f3..4d441a8 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -743,7 +743,10 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+         return e ? (int64_t) atoll(e) : (int64_t) 65536; // measured best on X2-90 (see commit)
+     }();
+     const int64_t n_vocab_head = head_w->ne[1];
+-    if (draft_vocab > 0 && draft_vocab < n_vocab_head && head_s == nullptr) {
++    if (model.mtp_draft_head != nullptr && head_w == model.output && head_s == nullptr) {
++        cur = ggml_mul_mat(ctx0, model.mtp_draft_head, cur);
++        cur = ggml_pad(ctx0, cur, (int) (n_vocab_head - model.mtp_draft_head->ne[1]), 0, 0, 0);
++    } else if (draft_vocab > 0 && draft_vocab < n_vocab_head && head_s == nullptr) {
+         ggml_tensor * head_sub = ggml_view_2d(ctx0, head_w, head_w->ne[0], draft_vocab, head_w->nb[1], 0);
+         cur = ggml_mul_mat(ctx0, head_sub, cur);
+         cur = ggml_pad(ctx0, cur, (int) (n_vocab_head - draft_vocab), 0, 0, 0);
+-- 
+2.55.0.windows.5
+

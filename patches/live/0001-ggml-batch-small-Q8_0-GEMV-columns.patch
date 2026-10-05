@@ -1,0 +1,235 @@
+From 133d62e2b2d13d5d2051c7114304b26fc3697731 Mon Sep 17 00:00:00 2001
+From: snap-pea <snap-pea@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 03:40:49 -0400
+Subject: [PATCH 01/19] ggml : batch small Q8_0 GEMV columns
+
+Assisted-by: Codex
+---
+ ggml/src/ggml-opencl/ggml-opencl.cpp          |  21 ++-
+ .../kernels/mul_mv_q8_0_f32_flat.cl           | 160 ++++++++++++++++++
+ 2 files changed, 179 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index a51dc7a..481f38f 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1589,6 +1589,8 @@ struct ggml_backend_opencl_context {
+     int       q6k_mc4_ndst = 0;
+     cl_kernel kernel_mul_mv_mxfp4_f32, kernel_mul_mv_mxfp4_f32_flat;
+     cl_kernel kernel_mul_mv_q8_0_f32, kernel_mul_mv_q8_0_f32_flat;
++    cl_kernel kernel_mul_mv_q8_0_f32_flat_mc = nullptr;
++    cl_kernel kernel_mul_mv_q8_0_f32_flat_mc8 = nullptr;
+     cl_kernel kernel_mul_mat_q8_0_f32_kq_gen = nullptr;
+     cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128 = nullptr;
+     cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128_img = nullptr;
+@@ -6529,6 +6531,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+ 
+         CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32_flat = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_mul_mv_q8_0_f32_flat", &err), err));
++        CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_mul_mv_q8_0_f32_flat_mc", &err), err));
++        cl_program program_mc8 = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts + " -DN_COLS_Q8_0_MC=8");
++        CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc8 = clCreateKernel(program_mc8, "kernel_mul_mv_q8_0_f32_flat_mc", &err), err));
++        CL_CHECK(clReleaseProgram(program_mc8));
+         GGML_LOG_CONT(".");
+     }
+ 
+@@ -47842,7 +47848,17 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+         }
+         case GGML_TYPE_Q8_0: {
+ #ifdef GGML_OPENCL_SOA_Q
+-            kernel = backend_ctx->kernel_mul_mv_q8_0_f32_flat;
++            if (ne11 >= 2 && ne11 <= 4 && ne11 == ne1 &&
++                backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc != nullptr) {
++                kernel = backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc;
++                ncols_per_wg = 4;
++            } else if (ne11 >= 5 && ne11 <= 8 && ne11 == ne1 &&
++                       backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc8 != nullptr) {
++                kernel = backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc8;
++                ncols_per_wg = 8;
++            } else {
++                kernel = backend_ctx->kernel_mul_mv_q8_0_f32_flat;
++            }
+ 
+             // nth0 - subgroup size
+             // nth1 - number of subgroups per workgroup
+@@ -50013,7 +50029,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+         // (number of workgroups) will be a nearest multiple of
+         // N_DST*N_SIMDGROUP to cover the size of the dimension. Below, 4 is
+         // N_DST*N_SIMDGROUP (see the kernel for Q4_0 matmul).
+-        size_t global_work_size[] = {(size_t)(ne01 + ndst-1)/ndst*nth0, (size_t)ne11*nth1, (size_t)ne12*ne13};
++        const size_t n_col_tiles = (size_t)(ne11 + ncols_per_wg - 1)/ncols_per_wg;
++        size_t global_work_size[] = {(size_t)(ne01 + ndst-1)/ndst*nth0, n_col_tiles*nth1, (size_t)ne12*ne13};
+         size_t local_work_size[] = {(size_t)nth0, (size_t)nth1, 1};
+ 
+         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
+index 397fe79..d1b78cf 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
+@@ -204,3 +204,163 @@ kernel void kernel_mul_mv_q8_0_f32_flat(
+         }
+     }
+ }
++
++#ifndef N_COLS_Q8_0_MC
++#define N_COLS_Q8_0_MC 4
++#endif
++
++#ifdef INTEL_GPU
++REQD_SUBGROUP_SIZE_16
++#elif defined (ADRENO_GPU)
++REQD_SUBGROUP_SIZE_64
++#endif
++kernel void kernel_mul_mv_q8_0_f32_flat_mc(
++    global char * src0_q,
++    global half * src0_d,
++    global char * src1,
++    ulong         offset1,
++    global char * dst,
++    ulong         offsetd,
++    int           ne00,
++    int           ne01,
++    ulong         nb01,
++    ulong         nb02,
++    ulong         nb03,
++    int           ne12,
++    ulong         nb11,
++    ulong         nb12,
++    ulong         nb13,
++    int           ne0,
++    int           ne1,
++    int           r2,
++    int           r3
++) {
++    src1 = (global char*)((global char*)src1 + offset1);
++    dst  = (global char*)((global char*)dst  + offsetd);
++
++    int nb = ne00/QK8_0;
++
++    int r0 = get_group_id(0);
++    int r1 = get_group_id(1);
++    int im = get_group_id(2);
++
++    int first_row = (r0*N_SG_Q8_0 + get_sub_group_id()) * N_R0_Q8_0;
++    first_row = min(first_row, max(ne01 - N_R0_Q8_0, 0));
++    int first_col = r1*N_COLS_Q8_0_MC;
++
++    uint i12 = im%ne12;
++    uint i13 = im/ne12;
++
++    ulong offset_src1_base = i12*nb12 + i13*nb13;
++    ulong offset_src0_base = first_row*nb01 + (i12/r2)*nb02 + (i13/r3)*nb03;
++
++    global char * ax0, * ax1, * ax2, * ax3;
++    global half * ad0, * ad1, * ad2, * ad3;
++    ulong offset_src0;
++
++    offset_src0 = offset_src0_base + 0*nb01;
++    offset_src0 = offset_src0/34;
++    ax0 = (global char *) ((global char *) src0_q + offset_src0*sizeof(char)*QK8_0);
++    ad0 = (global half *) ((global char *) src0_d + offset_src0*sizeof(half));
++
++    offset_src0 = offset_src0_base + 1*nb01;
++    offset_src0 = offset_src0/34;
++    ax1 = (global char *) ((global char *) src0_q + offset_src0*sizeof(char)*QK8_0);
++    ad1 = (global half *) ((global char *) src0_d + offset_src0*sizeof(half));
++
++    offset_src0 = offset_src0_base + 2*nb01;
++    offset_src0 = offset_src0/34;
++    ax2 = (global char *) ((global char *) src0_q + offset_src0*sizeof(char)*QK8_0);
++    ad2 = (global half *) ((global char *) src0_d + offset_src0*sizeof(half));
++
++    offset_src0 = offset_src0_base + 3*nb01;
++    offset_src0 = offset_src0/34;
++    ax3 = (global char *) ((global char *) src0_q + offset_src0*sizeof(char)*QK8_0);
++    ad3 = (global half *) ((global char *) src0_d + offset_src0*sizeof(half));
++
++    const short ix = get_sub_group_local_id()/4;
++    const short il = get_sub_group_local_id()%4;
++
++    float4 sumf[N_COLS_Q8_0_MC];
++    for (int c = 0; c < N_COLS_Q8_0_MC; c++) {
++        sumf[c] = (float4)(0.f);
++    }
++
++    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/4) {
++        float8 qv0 = convert_float8(vload8(0, ax0 + ib*QK8_0 + il*NB_Q8_0));
++        float8 qv1 = convert_float8(vload8(0, ax1 + ib*QK8_0 + il*NB_Q8_0));
++        float8 qv2 = convert_float8(vload8(0, ax2 + ib*QK8_0 + il*NB_Q8_0));
++        float8 qv3 = convert_float8(vload8(0, ax3 + ib*QK8_0 + il*NB_Q8_0));
++        float d0 = ad0[ib];
++        float d1 = ad1[ib];
++        float d2 = ad2[ib];
++        float d3 = ad3[ib];
++
++        for (int c = 0; c < N_COLS_Q8_0_MC; c++) {
++            const int col = first_col + c;
++            if (col < ne1) {
++                global float * y = (global float *)(src1 + offset_src1_base + col*nb11);
++                float8 yl = vload8(0, y + ix*QK8_0 + il*NB_Q8_0);
++
++                float sumq0 = 0.f;
++                sumq0 += qv0.s0*yl.s0;
++                sumq0 += qv0.s1*yl.s1;
++                sumq0 += qv0.s2*yl.s2;
++                sumq0 += qv0.s3*yl.s3;
++                sumq0 += qv0.s4*yl.s4;
++                sumq0 += qv0.s5*yl.s5;
++                sumq0 += qv0.s6*yl.s6;
++                sumq0 += qv0.s7*yl.s7;
++
++                float sumq1 = 0.f;
++                sumq1 += qv1.s0*yl.s0;
++                sumq1 += qv1.s1*yl.s1;
++                sumq1 += qv1.s2*yl.s2;
++                sumq1 += qv1.s3*yl.s3;
++                sumq1 += qv1.s4*yl.s4;
++                sumq1 += qv1.s5*yl.s5;
++                sumq1 += qv1.s6*yl.s6;
++                sumq1 += qv1.s7*yl.s7;
++
++                float sumq2 = 0.f;
++                sumq2 += qv2.s0*yl.s0;
++                sumq2 += qv2.s1*yl.s1;
++                sumq2 += qv2.s2*yl.s2;
++                sumq2 += qv2.s3*yl.s3;
++                sumq2 += qv2.s4*yl.s4;
++                sumq2 += qv2.s5*yl.s5;
++                sumq2 += qv2.s6*yl.s6;
++                sumq2 += qv2.s7*yl.s7;
++
++                float sumq3 = 0.f;
++                sumq3 += qv3.s0*yl.s0;
++                sumq3 += qv3.s1*yl.s1;
++                sumq3 += qv3.s2*yl.s2;
++                sumq3 += qv3.s3*yl.s3;
++                sumq3 += qv3.s4*yl.s4;
++                sumq3 += qv3.s5*yl.s5;
++                sumq3 += qv3.s6*yl.s6;
++                sumq3 += qv3.s7*yl.s7;
++
++                sumf[c] += (float4)(sumq0*d0, sumq1*d1, sumq2*d2, sumq3*d3);
++            }
++        }
++    }
++
++    for (int c = 0; c < N_COLS_Q8_0_MC; c++) {
++        float4 tot = (float4)(
++            sub_group_reduce_add(sumf[c].s0),
++            sub_group_reduce_add(sumf[c].s1),
++            sub_group_reduce_add(sumf[c].s2),
++            sub_group_reduce_add(sumf[c].s3)
++        );
++
++        if (get_sub_group_local_id() == 0 && first_col + c < ne1) {
++            global float * dst_f32 = (global float *) dst + (ulong)im*ne0*ne1 + (ulong)(first_col + c)*ne0;
++            if (first_row + 0 < ne01) dst_f32[first_row + 0] = tot.s0;
++            if (first_row + 1 < ne01) dst_f32[first_row + 1] = tot.s1;
++            if (first_row + 2 < ne01) dst_f32[first_row + 2] = tot.s2;
++            if (first_row + 3 < ne01) dst_f32[first_row + 3] = tot.s3;
++        }
++    }
++}
+-- 
+2.55.0.windows.5
+

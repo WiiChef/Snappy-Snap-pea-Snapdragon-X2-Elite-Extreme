@@ -1,0 +1,635 @@
+From 8f59bcde069a96730baf4cf6948d7f8423b353fc Mon Sep 17 00:00:00 2001
+From: snap-pea <snap-pea@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 12:14:50 -0400
+Subject: [PATCH] spec: port probabilistic MTP drafting with rejection verify
+ (upstream #27694)
+
+Opt-in via --spec-draft-sampling probabilistic; the fast top-k path re-weights its 10 candidates at the target temperature. Measured neutral-to-worse on the agent bench (45.1 at p-min 0.8 vs 45.4 greedy), so it stays off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/arg.cpp                  |  15 ++++
+ common/common.h                 |   2 +
+ common/sampling.cpp             | 126 ++++++++++++++++++++++++++++
+ common/sampling.h               |   3 +
+ common/speculative.cpp          | 142 ++++++++++++++++++++++++++++++--
+ common/speculative.h            |   7 ++
+ tools/server/server-context.cpp |  59 ++++++++++++-
+ 7 files changed, 343 insertions(+), 11 deletions(-)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 56ca9d3..b5d02ef 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -4206,6 +4206,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.speculative.draft.backend_sampling = value;
+         }
+     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
++    add_opt(common_arg(
++        {"--spec-draft-sampling"}, "{greedy,probabilistic}",
++        string_format("how the draft is sampled: greedy takes its argmax, probabilistic samples it and has "
++                      "the target verify by rejection sampling (default: %s)",
++                      params.speculative.draft.probabilistic ? "probabilistic" : "greedy"),
++        [](common_params & params, const std::string & value) {
++            if (value == "greedy") {
++                params.speculative.draft.probabilistic = false;
++            } else if (value == "probabilistic") {
++                params.speculative.draft.probabilistic = true;
++            } else {
++                throw std::invalid_argument("invalid value, must be one of: greedy, probabilistic");
++            }
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
+     add_opt(common_arg(
+         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
+         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"
+diff --git a/common/common.h b/common/common.h
+index e95eb2f..8100b28 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -333,6 +333,8 @@ struct common_params_speculative_draft {
+ 
+     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
+ 
++    bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
++
+     common_params_model mparams;
+ 
+     llama_context * ctx_tgt = nullptr;
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index e9e1cb3..d9c5080 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -12,6 +12,7 @@
+ #include <climits>
+ #include <cmath>
+ #include <cstring>
++#include <random>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -121,6 +122,9 @@ struct common_sampler {
+ 
+     llama_token_data_array cur_p;
+ 
++    // for rejection sampling; independent of the draft, or the target distribution is not preserved
++    std::mt19937 rng;
++
+     void reset() {
+         prev.clear();
+ 
+@@ -432,6 +436,8 @@ struct common_sampler * common_sampler_init(
+         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+         /* .cur     = */ {},
+         /* .cur_p   = */ {},
++        // mix it, the chain and the draft are seeded from this one too
++        /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+     };
+ 
+     return result;
+@@ -515,6 +521,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+         /* .prev    = */ gsmpl->prev,
+         /* .cur     = */ gsmpl->cur,
+         /* .cur_p   = */ gsmpl->cur_p,
++        /* .rng     = */ gsmpl->rng,
+     };
+ }
+ 
+@@ -535,6 +542,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+     dst->cur        = src->cur;
+     dst->cur_p      = src->cur_p;
+     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
++    dst->rng        = src->rng;
+     dst->t_total_us = src->t_total_us;
+ }
+ 
+@@ -709,6 +717,124 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
+     return result;
+ }
+ 
++static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
++    for (size_t k = 0; k < n; ++k) {
++        if (data[k].id == id) {
++            return data[k].p;
++        }
++    }
++    return 0.0f;
++}
++
++// Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
++// Preserves the target distribution exactly, and accepts more often than matching does when the
++// draft samples instead of taking its argmax.
++std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
++    GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
++    GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
++
++    std::vector<llama_token> result;
++    result.reserve(idxs.size());
++
++    // draws come from the sampler's own stream, so they stay independent of what was drafted
++    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
++
++    std::vector<llama_token_data> residual;
++
++    std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
++
++    size_t i = 0;
++    for (; i < draft.size(); i++) {
++        // leaves the target distribution in the candidate array
++        const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
++
++        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
++        const auto & q     = draft_q[i];
++
++        const bool masked = !grammar_first && grammar_should_apply(gsmpl);
++        if (masked) {
++            cand.assign(cur_p->data, cur_p->data + cur_p->size);
++            llama_token_data_array arr = { cand.data(), cand.size(), -1, false };
++            llama_sampler_apply(gsmpl->grmr, &arr);
++        }
++
++        // a candidate the grammar rejects carries no probability, whatever the target thinks
++        auto p_raw = [&](size_t k) {
++            return masked && cand[k].logit == -INFINITY ? 0.0f : cur_p->data[k].p;
++        };
++
++        // masking drops probability mass, so rescale what is left or the residual is over-weighted
++        float p_sum = 0.0f;
++        if (masked) {
++            for (size_t k = 0; k < cur_p->size; ++k) {
++                p_sum += p_raw(k);
++            }
++        }
++
++        const float p_norm = masked && p_sum > 0.0f ? 1.0f/p_sum : 1.0f;
++
++        auto p_of = [&](size_t k) {
++            return p_raw(k)*p_norm;
++        };
++
++        // q_x is never 0 for a token the draft produced, but guard the divide
++        const float q_x = prob_of(q.data(), q.size(), draft[i]);
++
++        float p_x = 0.0f;
++        for (size_t k = 0; k < cur_p->size; ++k) {
++            if (cur_p->data[k].id == draft[i]) {
++                p_x = p_of(k);
++                break;
++            }
++        }
++
++        if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
++            common_sampler_accept(gsmpl, draft[i], true);
++            result.push_back(draft[i]);
++            continue;
++        }
++
++        // rejected: tokens outside q's support keep all of p
++        residual.clear();
++        float sum = 0.0f;
++        for (size_t k = 0; k < cur_p->size; ++k) {
++            const float r = p_of(k) - prob_of(q.data(), q.size(), cur_p->data[k].id);
++            if (r > 0.0f) {
++                residual.push_back({ cur_p->data[k].id, 0.0f, r });
++                sum += r;
++            }
++        }
++
++        llama_token id = id_tgt;
++        if (sum > 0.0f) {
++            float u = uni(gsmpl->rng) * sum;
++            id = residual.back().id;
++            for (const auto & e : residual) {
++                u -= e.p;
++                if (u <= 0.0f) {
++                    id = e.id;
++                    break;
++                }
++            }
++        }
++
++        common_sampler_accept(gsmpl, id, true);
++        result.push_back(id);
++
++        break;
++    }
++
++    if (i == draft.size()) {
++        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
++
++        common_sampler_accept(gsmpl, id, true);
++
++        result.push_back(id);
++    }
++
++    return result;
++}
++
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {
+     std::vector<int> idxs(draft.size() + 1);
+     for (size_t i = 0; i < idxs.size(); ++i) {
+diff --git a/common/sampling.h b/common/sampling.h
+index ced3c83..7ebae3d 100644
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -85,6 +85,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+ //
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+ 
++// as above, but verifies by rejection sampling; draft_q holds the draft's candidates per token
++std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false);
++
+ // assume idxs == [ 0, 1, 2, ..., draft.size() ]
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+ 
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index a4d9be2..074fcaf 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -21,6 +21,7 @@
+ #include <functional>
+ #include <iomanip>
+ #include <map>
++#include <random>
+ #include <cinttypes>
+ 
+ #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+@@ -33,6 +34,45 @@
+ #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
+ #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
+ 
++// Rebuild seq_id's draft sampler at the target's temperature: rejection weighs q against p, so
++// both have to sample alike. Only temp and seed carry over; the draft keeps its own top_k.
++static void spec_retune(
++        std::vector<common_sampler_ptr> & smpls,
++        std::vector<common_params_sampling> & cfg,
++        const llama_model * model,
++        llama_seq_id seq_id,
++        float temp,
++        uint32_t seed) {
++    if (cfg.size() != smpls.size()) {
++        const size_t n_old = cfg.size();
++        cfg.resize(smpls.size());
++
++        // the initial sampler has no temperature, so no request may match the cache and skip a rebuild
++        for (size_t i = n_old; i < cfg.size(); ++i) {
++            cfg[i].temp = NAN;
++        }
++    }
++
++    auto & cur = cfg[seq_id];
++
++    if (cur.temp == temp && cur.seed == seed) {
++        return;
++    }
++
++    cur.temp = temp;
++    cur.seed = seed;
++
++    common_params_sampling sparams;
++    sparams.no_perf  = false;
++    sparams.top_k    = 10;
++    sparams.temp     = cur.temp;
++    // must be explicit, the default reseeds at random; mixed so it differs from the target's
++    sparams.seed     = cur.seed == LLAMA_DEFAULT_SEED ? cur.seed : cur.seed ^ 0x85ebca6bu;
++    sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE };
++
++    smpls[seq_id].reset(common_sampler_init(model, sparams));
++}
++
+ const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
+     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
+     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
+@@ -303,6 +343,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
+ 
+     std::vector<common_sampler_ptr> smpls;
+ 
++    std::vector<common_params_sampling> smpls_cfg;
++
+     common_speculative_impl_draft_simple(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE, n_seq, params.draft.n_max)
+         , params(params.draft)
+@@ -373,8 +415,9 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
+         llama_batch_free(batch);
+     }
+ 
+-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
+-        // noop
++    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
++        // reset here rather than per round, or two identical requests differ
++        common_sampler_reset(smpls[seq_id].get());
+     }
+ 
+     bool process(const llama_batch & batch, const std::vector<int32_t> * rows = nullptr) override {
+@@ -412,7 +455,20 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
+ 
+             n_drafting++;
+             drafting[seq_id] = true;
+-            common_sampler_reset(smpls[seq_id].get());
++            // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
++            if (!params.probabilistic) {
++                dp.result_q = nullptr;
++            }
++
++            // result_q is only set when the caller wants rejection, so it also gates the retune
++            if (dp.result_q) {
++                spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp, dp.seed);
++            }
++
++            // a reset reseeds the chain, which breaks probabilistic drafting
++            if (!dp.result_q) {
++                common_sampler_reset(smpls[seq_id].get());
++            }
+ 
+             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
+         }
+@@ -437,7 +493,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
+ 
+                 auto * smpl = smpls[seq_id].get();
+ 
+-                common_sampler_sample(smpl, ctx_dft, i_batch, true);
++                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_batch, true);
+                 ++i_batch;
+ 
+                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
+@@ -449,7 +505,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
+                 }
+ 
+                 // add drafted token for each sequence
+-                const llama_token id = cur_p->data[0].id;
++                const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
+ 
+                 // only collect very high-confidence draft tokens
+                 if (cur_p->data[0].p < params.p_min) {
+@@ -466,6 +522,10 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
+ 
+                 result.push_back(id);
+ 
++                if (dp.result_q) {
++                    dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
++                }
++
+                 if ((params.n_max <= (int) result.size()) ||
+                     (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
+                     drafting[seq_id] = false;
+@@ -1891,6 +1951,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         return &fast_arr;
+     }
+ 
++    // Probabilistic drafting on the fast path: re-weight fast_topk's 10 candidates at the target
++    // temperature (what the retuned top-k 10 + temp chain yields) and draw one from them.
++    std::vector<common_params_sampling> smpls_cfg;
++    std::mt19937 prob_rng;
++    uint32_t     prob_seed   = 0;
++    bool         prob_seeded = false;
++
++    const llama_token_data_array * fast_temp_sample(float temp, llama_token & id_out) {
++        const float inv_t = 1.0f / std::max(temp, 1e-4f);
++        const float mx = fast_cand[0].logit;
++        float sum = 0.0f;
++        for (auto & d : fast_cand) {
++            d.p = expf((d.logit - mx) * inv_t);
++            sum += d.p;
++        }
++        for (auto & d : fast_cand) d.p /= sum;
++
++        std::uniform_real_distribution<float> u(0.0f, 1.0f);
++        float r = u(prob_rng);
++        id_out = fast_cand.back().id;
++        for (const auto & d : fast_cand) {
++            r -= d.p;
++            if (r <= 0.0f) {
++                id_out = d.id;
++                break;
++            }
++        }
++        return &fast_arr;
++    }
++
+     // host/GPU split of the draft side (GGML_MTP_TIMING=1 prints it at exit)
+     int64_t tm_proc_us = 0, tm_dec_us = 0, tm_smpl_us = 0, tm_rest_us = 0;
+     int64_t tm_n_proc = 0, tm_n_dec = 0;
+@@ -1924,6 +2014,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     }
+ 
+     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
++        // reset here rather than per round, or two identical requests differ
++        common_sampler_reset(smpls[seq_id].get());
++
+         const int32_t N = (int32_t) prompt.size();
+         if (N <= 0) {
+             return;
+@@ -2260,7 +2353,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+             n_drafting++;
+             drafting[seq_id] = true;
+-            common_sampler_reset(smpls[seq_id].get());
++            // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
++            if (!params.probabilistic) {
++                dp.result_q = nullptr;
++            }
++
++            // result_q is only set when the caller wants rejection, so it also gates the retune
++            if (dp.result_q) {
++                spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp, dp.seed);
++                if (prob_seed != dp.seed || !prob_seeded) {
++                    prob_rng.seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : (dp.seed ^ 0x85ebca6bu));
++                    prob_seed   = dp.seed;
++                    prob_seeded = true;
++                }
++            }
++
++            // a reset reseeds the chain, which breaks probabilistic drafting
++            if (!dp.result_q) {
++                common_sampler_reset(smpls[seq_id].get());
++            }
+             // Captures the drafter's top-K at each spine position. Feeds both the rank probe
+             // and build_tree() below, so branching costs no extra drafter work.
+             rank_reserve(seq_id, std::max(1, params.n_max));
+@@ -2316,11 +2427,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 auto * smpl = smpls[seq_id].get();
+ 
+                 const int64_t ts0 = ggml_time_us();
++                const bool prob = dparams.at(seq_id).result_q != nullptr;
+                 const llama_token_data_array * cur_p = nullptr;
++                llama_token id_sampled = LLAMA_TOKEN_NULL;
+                 if (fast_topk_on) {
+                     cur_p = fast_topk(ctx_dft, i_last[seq_id]);
++                    if (prob) {
++                        // same distribution as the retuned sampler chain (top-k 10, then temp)
++                        cur_p = fast_temp_sample(dparams.at(seq_id).temp, id_sampled);
++                    }
+                 } else {
+-                    common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
++                    id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                     cur_p = common_sampler_get_candidates(smpl, true);
+                 }
+                 tm_smpl_us += ggml_time_us() - ts0;
+@@ -2333,7 +2450,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 }
+ 
+                 // add drafted token for each sequence
+-                const llama_token id = cur_p->data[0].id;
++                const llama_token id = prob ? id_sampled : cur_p->data[0].id;
+ 
+                 // only collect very high-confidence draft tokens
+                 if (cur_p->data[0].p < params.p_min) {
+@@ -2352,6 +2469,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+                 result.push_back(id);
+ 
++                if (dp.result_q) {
++                    dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
++                }
++
+                 // Kept in lockstep with `result`: entry i is the candidate list at spine
+                 // depth i. Free -- the list is already sampled and sorted.
+                 rank_push(seq_id, result.size() - 1, cur_p);
+@@ -3704,6 +3825,11 @@ void common_speculative_draft(common_speculative * spec) {
+                     if (!result.empty() && (int) result.size() > dp.n_max) {
+                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
+                         result.resize(dp.n_max);
++
++                        // the candidates are one per drafted token and must be cut with them
++                        if (dp.result_q) {
++                            dp.result_q->resize(dp.n_max);
++                        }
+                     }
+                 }
+ 
+diff --git a/common/speculative.h b/common/speculative.h
+index 865266f..46b3209 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -135,6 +135,13 @@ struct common_speculative_draft_params {
+     // A caller that ignores `tree` therefore behaves exactly as before.
+     // Left empty by implementations that do not branch.
+     common_speculative_draft_tree * tree = nullptr;
++
++    // candidate distribution per drafted token; set it to make draft-simple and draft-mtp sample
++    std::vector<std::vector<llama_token_data>> * result_q = nullptr;
++
++    // the target's temp and seed, read only when the drafter samples probabilistically
++    float    temp = 1.0f;
++    uint32_t seed = LLAMA_DEFAULT_SEED;
+ };
+ 
+ common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 2051628..bcb7ccb 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -52,6 +52,31 @@ static common_speculative_output_limits server_output_limits(const common_params
+     return result;
+ }
+ 
++// a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
++static std::vector<llama_token> server_accept_replay(
++        common_sampler * smpl,
++        llama_context * ctx,
++        const std::vector<int32_t> & idxs,
++        const llama_tokens & draft) {
++    GGML_ASSERT(idxs.size() == draft.size() + 1);
++
++    std::vector<llama_token> result;
++    result.reserve(idxs.size());
++
++    for (size_t i = 0; i < draft.size(); ++i) {
++        // the token is discarded - the call is what advances the sampler over this position
++        common_sampler_sample(smpl, ctx, idxs[i]);
++        common_sampler_accept(smpl, draft[i], true);
++        result.push_back(draft[i]);
++    }
++
++    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
++    common_sampler_accept(smpl, id, true);
++    result.push_back(id);
++
++    return result;
++}
++
+ // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
+ // on replay the draft was already accepted before a context checkpoint restore, so repeat the same decisions
+ static std::vector<llama_token> server_sample_and_accept_synth(
+@@ -269,6 +294,9 @@ struct server_slot {
+     common_speculative * spec;
+ 
+     llama_tokens spec_draft;
++
++    // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
++    std::vector<std::vector<llama_token_data>> spec_draft_q;
+     llama_tokens spec_prompt;
+     std::vector<int32_t> spec_i_batch;
+     common_prompt_checkpoint spec_ckpt;
+@@ -512,6 +540,11 @@ struct server_slot {
+         return !!spec;
+     }
+ 
++    // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
++    bool use_spec_rejection() const {
++        return task && task->params.sampling.temp > 0.0f;
++    }
++
+     void add_token(const completion_token_output & token) {
+         if (!is_processing()) {
+             SLT_WRN(*this, "%s", "slot is not processing\n");
+@@ -3128,6 +3161,9 @@ private:
+                 if (n_draft_max > 0) {
+                     GGML_ASSERT(slot.can_speculate());
+ 
++                    // stale candidates: a replay never reads them, a new draft refills them
++                    slot.spec_draft_q.clear();
++
+                     if (!slot.spec_draft.empty()) {
+                         // we have a previous (partial) draft to reuse
+                         if (use_ckpt_tgt) {
+@@ -3147,6 +3183,8 @@ private:
+ 
+                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+ 
++                        const bool spec_reject = slot.use_spec_rejection();
++
+                         common_speculative_get_draft_params(spec.get(), slot.id) = {
+                             /* .drafting = */ true,
+                             /* .n_max    = */ n_draft_max,
+@@ -3155,6 +3193,9 @@ private:
+                             /* .prompt   = */ &slot.spec_prompt,
+                             /* .result   = */ &slot.spec_draft,
+                             /* .tree     = */ &slot.spec_tree,
++                            /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
++                            /* .temp     = */ slot.task->params.sampling.temp,
++                            /* .seed     = */ slot.task->params.sampling.seed,
+                         };
+ 
+                         drafting.push_back(&slot);
+@@ -4182,12 +4223,24 @@ private:
+                     }
+                 } else {
+                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
++                    GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
+                     const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+-                    accepted = synth_probs.empty()
+-                        ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
+-                        : server_sample_and_accept_synth(
++
++                    // drafters that fill no distribution fall back here
++                    const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
++
++                    if (!synth_probs.empty()) {
++                        // synthetic acceptance replaces verification entirely, so it comes first
++                        accepted = server_sample_and_accept_synth(
+                                 slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                                 synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
++                    } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
++                        accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
++                    } else if (use_rejection) {
++                        accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
++                    } else {
++                        accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
++                    }
+                 }
+                 slot.spec_i_batch.clear();
+ 
+-- 
+2.55.0.windows.5
+

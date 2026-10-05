@@ -1,0 +1,115 @@
+From 54f880f05f251647feb82b21804ea2c803dc79bc Mon Sep 17 00:00:00 2001
+From: snap-pea <snap-pea@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 08:54:09 -0400
+Subject: [PATCH 17/19] speculative: MTP draft top-10 without the sampler (scan
+ only the real draft-head rows)
+
+The MTP draft chain is a stateless top-k (k=10), and the reduced-vocabulary draft head pads
+each logits row past LLAMA_MTP_DRAFT_VOCAB with zeros, so every draft step sorted a 248k row.
+fast_topk scans the real rows, admits padding zeros exactly where they would rank, and applies
+the same softmax over the 10. Greedy MTP output and acceptance byte-identical; draft sampling
+85 -> 15 ms per 260-token run; code prompt 42.6 -> 44.1 tok/s. Opt out: GGML_MTP_FAST_TOPK=0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp | 67 +++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 63 insertions(+), 4 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index a2723ad..ff205f5 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1837,6 +1837,59 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         verify_h_rows.assign(n_seq, 0);
+     }
+ 
++    // Draft candidates without the sampler: the draft chain is a bare top-k (k = 10, no state), and
++    // the reduced-vocabulary draft head pads every row past LLAMA_MTP_DRAFT_VOCAB with zeros, so the
++    // sampler sorted a 248k row to find the top 10. fast_topk scans the real rows and admits padding
++    // zeros exactly where they would rank, then applies the same softmax over the 10.
++    // Opt out: GGML_MTP_FAST_TOPK=0.
++    bool fast_topk_on = [] { const char * e = getenv("GGML_MTP_FAST_TOPK"); return !(e && e[0] == '0'); }();
++    std::vector<llama_token_data> fast_cand;
++    llama_token_data_array        fast_arr = { nullptr, 0, -1, false };
++
++    const llama_token_data_array * fast_topk(llama_context * ctx, int32_t idx) {
++        constexpr int K = 10;
++        const float * lg = llama_get_logits_ith(ctx, idx);
++        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++        static const int32_t v_env = [] { const char * e = getenv("LLAMA_MTP_DRAFT_VOCAB"); return e ? (int32_t) atoll(e) : 65536; }();
++        const int32_t n_real = (v_env > 0 && v_env < n_vocab) ? v_env : n_vocab;
++
++        fast_cand.clear();
++        // running top-K (ascending by logit at index 0 = current minimum)
++        llama_token_data top[K];
++        int n_top = 0;
++        auto push = [&](llama_token id, float l) {
++            if (n_top < K) {
++                top[n_top++] = { id, l, 0.0f };
++                for (int j = n_top - 1; j > 0 && top[j].logit < top[j - 1].logit; --j) std::swap(top[j], top[j - 1]);
++            } else if (l > top[0].logit) {
++                top[0] = { id, l, 0.0f };
++                for (int j = 0; j + 1 < K && top[j].logit > top[j + 1].logit; ++j) std::swap(top[j], top[j + 1]);
++            }
++        };
++        for (int32_t t = 0; t < n_real; ++t) {
++            if (n_top < K || lg[t] > top[0].logit) {
++                push(t, lg[t]);
++            }
++        }
++        // padded rows are exactly 0: they enter in id order while they outrank the current minimum
++        for (int32_t t = n_real; t < n_vocab && (n_top < K || 0.0f > top[0].logit); ++t) {
++            push(t, 0.0f);
++        }
++
++        float sum = 0.0f;
++        const float mx = top[n_top - 1].logit;
++        for (int j = n_top - 1; j >= 0; --j) {
++            llama_token_data d = top[j];
++            d.p = expf(d.logit - mx);
++            sum += d.p;
++            fast_cand.push_back(d);
++        }
++        for (auto & d : fast_cand) d.p /= sum;
++
++        fast_arr = { fast_cand.data(), fast_cand.size(), 0, true };
++        return &fast_arr;
++    }
++
+     // host/GPU split of the draft side (GGML_MTP_TIMING=1 prints it at exit)
+     int64_t tm_proc_us = 0, tm_dec_us = 0, tm_smpl_us = 0, tm_rest_us = 0;
+     int64_t tm_n_proc = 0, tm_n_dec = 0;
+@@ -2202,12 +2255,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 auto * smpl = smpls[seq_id].get();
+ 
+                 const int64_t ts0 = ggml_time_us();
+-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
++                const llama_token_data_array * cur_p = nullptr;
++                if (fast_topk_on) {
++                    cur_p = fast_topk(ctx_dft, i_last[seq_id]);
++                } else {
++                    common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
++                    cur_p = common_sampler_get_candidates(smpl, true);
++                }
+                 tm_smpl_us += ggml_time_us() - ts0;
+                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+ 
+-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+-
+                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                             seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+@@ -2225,7 +2282,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     continue;
+                 }
+ 
+-                common_sampler_accept(smpl, id, true);
++                if (!fast_topk_on) {
++                    common_sampler_accept(smpl, id, true);
++                }
+ 
+                 auto & dp = dparams.at(seq_id);
+                 auto & result = *dp.result;
+-- 
+2.55.0.windows.5
+

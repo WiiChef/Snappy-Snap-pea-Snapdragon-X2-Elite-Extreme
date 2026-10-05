@@ -1,0 +1,41 @@
+From d56c802965657fa174ac2656e09e12a1c2c0d4b8 Mon Sep 17 00:00:00 2001
+From: snap-pea <snap-pea@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 09:46:12 -0400
+Subject: [PATCH 19/19] mtp chain: copy each step's logits row into a
+ preallocated output instead of a growing concat
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/models/qwen35moe.cpp | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index ac840f8..cbf1b27 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -637,7 +637,9 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+ 
+         ggml_tensor * x_tok = ggml_view_2d(ctx0, tok_embd, tok_embd->ne[0], 1, tok_embd->nb[1], 0);
+         ggml_tensor * x_h   = ggml_view_2d(ctx0, h_embd,   h_embd->ne[0],   1, h_embd->nb[1],   0);
+-        ggml_tensor * logits_all = nullptr;
++        // each step's logits row is copied straight into its row of logits_all (a growing concat
++        // re-copied every earlier row: ~2.7 ms per 7-step chain)
++        ggml_tensor * logits_all = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_real, n_tokens);
+         ggml_tensor * h_all      = nullptr;
+ 
+         for (int64_t i = 0; i < n_tokens; ++i) {
+@@ -703,8 +705,9 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+             ggml_tensor * h_i = build_norm(c, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+             ggml_tensor * l_i = ggml_mul_mat(ctx0, head_use, h_i);   // [n_real, 1]
+ 
+-            h_all      = h_all      ? ggml_concat(ctx0, h_all,      h_i, 1) : h_i;
+-            logits_all = logits_all ? ggml_concat(ctx0, logits_all, l_i, 1) : l_i;
++            h_all = h_all ? ggml_concat(ctx0, h_all, h_i, 1) : h_i;
++            ggml_build_forward_expand(gf, ggml_cpy(ctx0, l_i,
++                    ggml_view_2d(ctx0, logits_all, n_real, 1, logits_all->nb[1], i * logits_all->nb[1])));
+ 
+             if (i + 1 < n_tokens) {
+                 ggml_tensor * id = ggml_top_k(ctx0, l_i, 1);
+-- 
+2.55.0.windows.5
+

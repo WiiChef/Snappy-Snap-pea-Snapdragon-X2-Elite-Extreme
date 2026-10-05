@@ -1,0 +1,132 @@
+From f9b4ef5a683bffadfce507d6546c4afc885043e0 Mon Sep 17 00:00:00 2001
+From: snap-pea <snap-pea@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 02:51:42 -0400
+Subject: [PATCH 09/19] opencl: route q8_0 dk256 GQA8 speculative-verify
+ attention (2..8 queries) to the row-per-lane kernel
+
+Verify batches went through the decompose path, whose cost grows ~10x faster with
+depth than a decode step (pp5 +51 ms per batch at d32768 vs +5.5 ms for tg1).
+kernel_fa_q8_d256_g8_dec already indexes Q, mask and partial records by query row,
+so batches of 2..8 queries with n_kv >= 2048 now skip decompose and take the MQ
+flash-decoding route with it (one work-group per query row and split; KV read once
+per row for the whole gqa group). Below 2048 the old path stays (it measured faster).
+
+X2-90 Qwen3.6-35B-A3B q8_0 KV pp5 (steady state): d4096 71.1 -> 76.2, d16384
+55.4 -> 65.6, d32768 42.3 -> 55.5 t/s. MTP decode after an 85k-token prompt:
+15.2 -> 20.5 tok/s. test-backend-ops FLASH_ATTN_EXT 2985/2985 (nb 2/4/8 at kv up
+to 32768). Opt out: GGML_OPENCL_FA_Q8_D256_LPR_NQ=0.
+Also: GGML_MTP_TIMING=1 prints the MTP draft-side host/GPU split at exit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp               | 25 +++++++++++++++++++++++++
+ ggml/src/ggml-opencl/ggml-opencl.cpp | 19 ++++++++++++++++---
+ 2 files changed, 41 insertions(+), 3 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 4451ca6..a2723ad 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1837,7 +1837,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         verify_h_rows.assign(n_seq, 0);
+     }
+ 
++    // host/GPU split of the draft side (GGML_MTP_TIMING=1 prints it at exit)
++    int64_t tm_proc_us = 0, tm_dec_us = 0, tm_smpl_us = 0, tm_rest_us = 0;
++    int64_t tm_n_proc = 0, tm_n_dec = 0;
++
+     ~common_speculative_impl_draft_mtp() override {
++        if (getenv("GGML_MTP_TIMING")) {
++            fprintf(stderr, "mtp timing: process %lld calls %.1f ms | draft decode %lld calls %.1f ms | sample %.1f ms | rest %.1f ms\n",
++                    (long long) tm_n_proc, tm_proc_us / 1000.0, (long long) tm_n_dec, tm_dec_us / 1000.0,
++                    tm_smpl_us / 1000.0, tm_rest_us / 1000.0);
++            const auto pd = llama_perf_context(this->params.ctx_dft);
++            fprintf(stderr, "mtp ctx_dft: n_eval %d n_p_eval %d graphs reused %d t_eval %.1f ms t_p_eval %.1f ms\n",
++                    pd.n_eval, pd.n_p_eval, pd.n_reused, pd.t_eval_ms, pd.t_p_eval_ms);
++        }
+         auto * ctx_dft = this->params.ctx_dft;
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
+             if (backend_chains[seq_id] == nullptr) {
+@@ -1983,6 +1995,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     }
+ 
+     bool process(const llama_batch & batch_in, const std::vector<int32_t> * rows = nullptr) override {
++        const int64_t t0 = ggml_time_us();
++        const bool ok = process_impl(batch_in, rows);
++        tm_proc_us += ggml_time_us() - t0;
++        tm_n_proc++;
++        return ok;
++    }
++
++    bool process_impl(const llama_batch & batch_in, const std::vector<int32_t> * rows) {
+         if (batch_in.n_tokens <= 0) {
+             return true;
+         }
+@@ -2160,7 +2180,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 llama_set_nextn_layer_offset(ctx_dft, i);
+             }
+ 
++            const int64_t td0 = ggml_time_us();
+             int ret = llama_decode(ctx_dft, batch);
++            tm_dec_us += ggml_time_us() - td0;
++            tm_n_dec++;
+             if (ret != 0) {
+                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
+                 break;
+@@ -2178,7 +2201,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+                 auto * smpl = smpls[seq_id].get();
+ 
++                const int64_t ts0 = ggml_time_us();
+                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
++                tm_smpl_us += ggml_time_us() - ts0;
+                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+ 
+                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 9cce1aa..12a9c88 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -33165,7 +33165,20 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     // it declines and falls through here whenever the shape does not fit.
+     // Placed after the prepass compile because the V transpose it needs ships in
+     // that program.
+-    if (n_q > 1 && ggml_cl_flash_attn_decompose(backend, q, k, v, mask, sinks, dst)) {
++    // Speculative-verify batches (2..8 queries) on q8_0 KV, dk=dv=256, gqa 8 go to the row-per-lane
++    // flash-decoding kernel (one work-group per query row, KV read once per row for the whole gqa
++    // group) instead of the decompose path, whose cost grows ~10x faster with depth
++    // (X2-90 Qwen3.6-35B-A3B pp5: +51 ms per batch at d32768 vs +5.5 ms for a decode step).
++    // Opt out: GGML_OPENCL_FA_Q8_D256_LPR_NQ=0.
++    const bool lpr_nq = n_q >= 2 && n_q <= 8 && n_kv >= 2048 &&
++        k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 && q->type == GGML_TYPE_F32 &&
++        d_head_q == 256 && d_head_v == 256 && n_head == n_head_kv * 8 && sinks == nullptr &&
++        ((const float *) dst->op_params)[1] == 0.0f && ((const float *) dst->op_params)[2] == 0.0f &&
++        (mask == nullptr || mask->type == GGML_TYPE_F16) &&
++        backend_ctx->kernel_fa_q8_d256_g8_dec != nullptr &&
++        !ggml_cl_env_flag_zero("GGML_OPENCL_FA_Q8_D256_LPR") &&
++        !ggml_cl_env_flag_zero("GGML_OPENCL_FA_Q8_D256_LPR_NQ");
++    if (n_q > 1 && !lpr_nq && ggml_cl_flash_attn_decompose(backend, q, k, v, mask, sinks, dst)) {
+         return;
+     }
+     cl_kernel kernel = NULL;
+@@ -33933,7 +33946,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+                                            ? atoi(vec_nq_env) : 8;
+ 
+         const bool nq_in_vec_range = (n_q == 1) ||
+-                                     (is_mixed && n_q >= 1 && n_q <= N_MAX_VEC_NQ);
++                                     (is_mixed && n_q >= 1 && n_q <= N_MAX_VEC_NQ) || lpr_nq;
+         const bool nq1_only        = (n_q == 1);
+         // Cluster-parallel decode (c8): default derived at init into
+         // fa_c8_default_on (gen_level >= X1: X1E/A8X/X2E and newer; see the
+@@ -34276,7 +34289,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+                 fd_mq_wg   = 192;
+             // q8_0 KV dk=256 gqa 8 (Qwen3.5/3.6 MoE): row-per-lane split kernel kernel_fa_q8_d256_g8_dec.
+             // Opt out: GGML_OPENCL_FA_Q8_D256_LPR=0.
+-            } else if (nq1_only && is_q8_0 && d_head_q == 256 && d_head_v == 256 && gqa_ratio_dispatch == 8 &&
++            } else if ((nq1_only || lpr_nq) && is_q8_0 && d_head_q == 256 && d_head_v == 256 && gqa_ratio_dispatch == 8 &&
+                 n_head == n_head_kv * 8 && max_bias == 0.0f && logit_softcap == 0.0f &&
+                 (mask == nullptr || mask->type == GGML_TYPE_F16) &&
+                 backend_ctx->kernel_fa_q8_d256_g8_dec != nullptr &&
+-- 
+2.55.0.windows.5
+
