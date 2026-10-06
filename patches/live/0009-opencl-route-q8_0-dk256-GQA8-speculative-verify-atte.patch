@@ -1,4 +1,4 @@
-From f9b4ef5a683bffadfce507d6546c4afc885043e0 Mon Sep 17 00:00:00 2001
+From 74ac0f28c52403cfe3e9a8225302606e20a509d5 Mon Sep 17 00:00:00 2001
 From: snap-pea <snap-pea@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 02:51:42 -0400
 Subject: [PATCH 09/19] opencl: route q8_0 dk256 GQA8 speculative-verify
@@ -24,7 +24,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 41 insertions(+), 3 deletions(-)
 
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 4451ca6..a2723ad 100644
+index 4451ca67e..a2723adc7 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -1837,7 +1837,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
@@ -84,10 +84,10 @@ index 4451ca6..a2723ad 100644
  
                  const auto * cur_p = common_sampler_get_candidates(smpl, true);
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 9cce1aa..12a9c88 100644
+index 640816562..d1861165a 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -33165,7 +33165,20 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -33575,7 +33575,20 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      // it declines and falls through here whenever the shape does not fit.
      // Placed after the prepass compile because the V transpose it needs ships in
      // that program.
@@ -109,7 +109,7 @@ index 9cce1aa..12a9c88 100644
          return;
      }
      cl_kernel kernel = NULL;
-@@ -33933,7 +33946,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -34347,7 +34360,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                                             ? atoi(vec_nq_env) : 8;
  
          const bool nq_in_vec_range = (n_q == 1) ||
@@ -118,7 +118,7 @@ index 9cce1aa..12a9c88 100644
          const bool nq1_only        = (n_q == 1);
          // Cluster-parallel decode (c8): default derived at init into
          // fa_c8_default_on (gen_level >= X1: X1E/A8X/X2E and newer; see the
-@@ -34276,7 +34289,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -34701,7 +34714,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                  fd_mq_wg   = 192;
              // q8_0 KV dk=256 gqa 8 (Qwen3.5/3.6 MoE): row-per-lane split kernel kernel_fa_q8_d256_g8_dec.
              // Opt out: GGML_OPENCL_FA_Q8_D256_LPR=0.

@@ -1,8 +1,8 @@
-From 8f59bcde069a96730baf4cf6948d7f8423b353fc Mon Sep 17 00:00:00 2001
+From 1d1a82ee006e0d502c6c060712f3a523ffce44f2 Mon Sep 17 00:00:00 2001
 From: snap-pea <snap-pea@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 12:14:50 -0400
-Subject: [PATCH] spec: port probabilistic MTP drafting with rejection verify
- (upstream #27694)
+Subject: [PATCH 3/3] spec: port probabilistic MTP drafting with rejection
+ verify (upstream #27694)
 
 Opt-in via --spec-draft-sampling probabilistic; the fast top-k path re-weights its 10 candidates at the target temperature. Measured neutral-to-worse on the agent bench (45.1 at p-min 0.8 vs 45.4 greedy), so it stays off.
 
@@ -18,7 +18,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  7 files changed, 343 insertions(+), 11 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 56ca9d3..b5d02ef 100644
+index 56ca9d3bf..b5d02ef40 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -4206,6 +4206,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -44,7 +44,7 @@ index 56ca9d3..b5d02ef 100644
          {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
          "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"
 diff --git a/common/common.h b/common/common.h
-index e95eb2f..8100b28 100644
+index e95eb2fd0..8100b28c5 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -333,6 +333,8 @@ struct common_params_speculative_draft {
@@ -57,7 +57,7 @@ index e95eb2f..8100b28 100644
  
      llama_context * ctx_tgt = nullptr;
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index e9e1cb3..d9c5080 100644
+index e9e1cb372..d9c508049 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -12,6 +12,7 @@
@@ -229,7 +229,7 @@ index e9e1cb3..d9c5080 100644
      std::vector<int> idxs(draft.size() + 1);
      for (size_t i = 0; i < idxs.size(); ++i) {
 diff --git a/common/sampling.h b/common/sampling.h
-index ced3c83..7ebae3d 100644
+index ced3c8364..7ebae3df8 100644
 --- a/common/sampling.h
 +++ b/common/sampling.h
 @@ -85,6 +85,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
@@ -243,7 +243,7 @@ index ced3c83..7ebae3d 100644
  std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
  
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index a4d9be2..074fcaf 100644
+index a4d9be212..074fcafd1 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -21,6 +21,7 @@
@@ -498,7 +498,7 @@ index a4d9be2..074fcaf 100644
                  }
  
 diff --git a/common/speculative.h b/common/speculative.h
-index 865266f..46b3209 100644
+index 865266f92..46b3209df 100644
 --- a/common/speculative.h
 +++ b/common/speculative.h
 @@ -135,6 +135,13 @@ struct common_speculative_draft_params {
@@ -516,7 +516,7 @@ index 865266f..46b3209 100644
  
  common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 2051628..bcb7ccb 100644
+index 205162877..bcb7ccb24 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -52,6 +52,31 @@ static common_speculative_output_limits server_output_limits(const common_params

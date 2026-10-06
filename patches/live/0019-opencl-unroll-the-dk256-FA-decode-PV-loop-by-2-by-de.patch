@@ -1,4 +1,4 @@
-From a89c4bf7764c4e05a322de532b34624c6285270f Mon Sep 17 00:00:00 2001
+From 13115652768d867a135579b6d17ccd3261137065 Mon Sep 17 00:00:00 2001
 From: snap-pea <snap-pea@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 22:10:08 -0400
 Subject: [PATCH 19/19] opencl: unroll the dk256 FA decode PV loop by 2 by
@@ -13,10 +13,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 14 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index d515dab..7d0e701 100644
+index 9e9016bcb..fbad857e9 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -6543,8 +6543,18 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -6630,8 +6630,18 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
  #else
          const std::string kernel_src = read_file("mul_mv_q8_0_f32_flat.cl");
  #endif
@@ -37,7 +37,7 @@ index d515dab..7d0e701 100644
          CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32_flat = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_mul_mv_q8_0_f32_flat", &err), err));
          CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_mul_mv_q8_0_f32_flat_mc", &err), err));
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
-index 4d0f419..8062c87 100644
+index 4d0f41906..8062c871c 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
 @@ -716,6 +716,9 @@ kernel void kernel_fa_q8_d256_g8_dec(

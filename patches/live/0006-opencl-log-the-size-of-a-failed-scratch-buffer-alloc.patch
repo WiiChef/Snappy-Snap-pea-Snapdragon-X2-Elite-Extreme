@@ -1,4 +1,4 @@
-From 3342a470930ad81b97bb737c0f098a82dd888745 Mon Sep 17 00:00:00 2001
+From eb778a0b59de9884614610334340751225930775 Mon Sep 17 00:00:00 2001
 From: snap-pea <snap-pea@users.noreply.github.com>
 Date: Sun, 4 Oct 2026 20:02:05 -0400
 Subject: [PATCH 06/19] opencl: log the size of a failed scratch-buffer
@@ -10,10 +10,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 5 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 084994e..5d7a572 100644
+index d10dd3a65..6cb0f8fef 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -621,7 +621,11 @@ struct ggml_cl_buffer {
+@@ -623,7 +623,11 @@ struct ggml_cl_buffer {
                  CL_CHECK(clReleaseMemObject(buffer));
              }
              cl_int err;

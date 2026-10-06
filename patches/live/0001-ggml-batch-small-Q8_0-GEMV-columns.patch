@@ -1,4 +1,4 @@
-From 133d62e2b2d13d5d2051c7114304b26fc3697731 Mon Sep 17 00:00:00 2001
+From 3e1643e2bb6167ff64a909ecf0589241c75ce1ef Mon Sep 17 00:00:00 2001
 From: snap-pea <snap-pea@users.noreply.github.com>
 Date: Sun, 4 Oct 2026 03:40:49 -0400
 Subject: [PATCH 01/19] ggml : batch small Q8_0 GEMV columns
@@ -10,10 +10,10 @@ Assisted-by: Codex
  2 files changed, 179 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index a51dc7a..481f38f 100644
+index 0473d93c6..fe4d70786 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1589,6 +1589,8 @@ struct ggml_backend_opencl_context {
+@@ -1597,6 +1597,8 @@ struct ggml_backend_opencl_context {
      int       q6k_mc4_ndst = 0;
      cl_kernel kernel_mul_mv_mxfp4_f32, kernel_mul_mv_mxfp4_f32_flat;
      cl_kernel kernel_mul_mv_q8_0_f32, kernel_mul_mv_q8_0_f32_flat;
@@ -22,7 +22,7 @@ index a51dc7a..481f38f 100644
      cl_kernel kernel_mul_mat_q8_0_f32_kq_gen = nullptr;
      cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128 = nullptr;
      cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128_img = nullptr;
-@@ -6529,6 +6531,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -6616,6 +6618,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
              build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
  
          CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32_flat = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_mul_mv_q8_0_f32_flat", &err), err));
@@ -33,7 +33,7 @@ index a51dc7a..481f38f 100644
          GGML_LOG_CONT(".");
      }
  
-@@ -47842,7 +47848,17 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -48288,7 +48294,17 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
          }
          case GGML_TYPE_Q8_0: {
  #ifdef GGML_OPENCL_SOA_Q
@@ -52,7 +52,7 @@ index a51dc7a..481f38f 100644
  
              // nth0 - subgroup size
              // nth1 - number of subgroups per workgroup
-@@ -50013,7 +50029,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -50459,7 +50475,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
          // (number of workgroups) will be a nearest multiple of
          // N_DST*N_SIMDGROUP to cover the size of the dimension. Below, 4 is
          // N_DST*N_SIMDGROUP (see the kernel for Q4_0 matmul).
@@ -63,7 +63,7 @@ index a51dc7a..481f38f 100644
  
          backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
-index 397fe79..d1b78cf 100644
+index 397fe79bc..d1b78cfa8 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
 @@ -204,3 +204,163 @@ kernel void kernel_mul_mv_q8_0_f32_flat(

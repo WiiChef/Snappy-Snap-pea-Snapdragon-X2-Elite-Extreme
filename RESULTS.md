@@ -103,3 +103,15 @@ measured streaming bandwidth), drafting ~16% (GPU ~1.45 ms/step + ~0.9 ms llama_
 - 2026-10-05 late: fixed-width (-DMC_NCOL) verify GEMVs +2.2% (45.4 -> 46.4, identical outputs); FA dk256 PV unroll 2 +1.5-2% at 64k. n-max 10/12: accepted tokens flat (2198/2214 vs 2227), drafts past 7 mostly rejected -> wider verify kernels and adaptive n-max not worth it. Live (mtp-smallbatch 8867485): 46.3 tok/s, agentbench 9/10 (09-wait-health timing check, flaky: fails ~half of all q6k runs).
 - Live switched to d289633 (no fork merge; outputs identical to merged build, 2227 acc). Task 9 reruns: new 3/5 vs morning binary 6/6 (chance ~18%).
 - 2026-10-06: seeded bench shows morning binary == a89c4bf == d289633 == fork-merged build token for token (2227). Live = a89c4bf, 46.4 tok/s.
+
+## 2026-10-06 NPU + profile
+- Latest upstream Hexagon (43fe9c6, skel re-signed with the existing GGML.HTP.v1 test cert): Q6_K MUL_MAT_ID 128x768x2048: n1 77us (GPU 77), n4 278us (GPU 403), n8 2618us (GPU 632). A crash in the NPU perf run then wedged the NPU (session open 0x80000406) and the GPU could no longer allocate the dev build's buffers (even at 64k) -> reboot needed. GPU+NPU concurrency was already known to corrupt output.
+- Profile (prof_live.csv, code prompt, 51.5 tok/s): verify MoE dp4a GEMM 33% + reorder 5%, target lm_head verify (mc_lds) 10% at ~68 GB/s vs 128 GB/s single-col, draft head Q4_0 6%.
+- GGML_OPENCL_MOE_GEMV_MAX_TOK=8 (fork hook, needs the 8085b4e merge): verify MoE via the f32 GEMV per token: 48.0 vs 46.5 tok/s (+3.2%); cutoff 4 = 48.0, 6 = 48.4 (noise). Changes outputs (fp32 activations instead of q8_1) -> needs agentbench before deploy.
+- lm_head row-group loop (GGML_OPENCL_Q8_MC_LDS_RG) built, untested (blocked by the post-NPU memory state).
+
+## 2026-10-06 Qualcomm audit + NPU
+- Branch audit (git, 80+ qualcomm OpenCL branches): features either already in x2-unified-everything (rebased/reworded) or for other chips/quants. Option audit (264 relevant GGML_OPENCL_* knobs): opt-in/gated ones measured on dev+GEMV8 (base 47.6 tg / 337.5 pp): FUSE_RMS_ROPE_SET_ROWS 47.9/337.8 (noise, changes output), ADRENO_USE_LARGE_BUFFER 47.1, XMEM_SDPA 46.6/334.6, Q8_DENSE_DP4A_WIMG 46.4/343, Q8_0_DP4A_ALDS4 47.0/353.1 (+4.6% pp, identical output) KEEP, MOE_RAGGED_STATICIDX 46.2/334.5. GLU fusions are q4_K-only (no q6_K gate+up fused MoE GEMV exists).
+- lm_head row-group loop: raised register use past the 512-item WG -> enqueue failure; reverted.
+- NPU after reboot (upstream 43fe9c6, our shapes): MUL_MAT_ID n1 53us n2 100 n4 198 (= GPU per-token GEMV), n5-8 1.3-2.2 ms. Full model on HTP0: pp512 314, tg32 18.2 (GPU 550 / 32). No NPU route adds speed.
+- Deployed 2026-10-06: 46b7cc1 + MOE_GEMV_MAX_TOK=8 + Q8_0_DP4A_ALDS4=1; agentbench 10/10 (q6k-oct6).

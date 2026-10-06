@@ -1,4 +1,4 @@
-From 99800926447e6f6f3aec1697d649ec251639bb9d Mon Sep 17 00:00:00 2001
+From 7d42d6ca844a4930112a8f959a09a8dbfa4d344d Mon Sep 17 00:00:00 2001
 From: snap-pea <snap-pea@users.noreply.github.com>
 Date: Sun, 4 Oct 2026 09:10:08 -0400
 Subject: [PATCH 05/19] ggml : int8 (dp4a) multi-column Q8_0 verify GEMV
@@ -15,10 +15,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 156 insertions(+)
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 474dfc0..084994e 100644
+index 48ed71211..d10dd3a65 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1146,6 +1146,8 @@ struct ggml_backend_opencl_context {
+@@ -1152,6 +1152,8 @@ struct ggml_backend_opencl_context {
      ggml_cl_buffer prealloc_act_trans;
      ggml_cl_buffer prealloc_splitk_partial;  // [ksplit * M] partials for split-K GEMV
      // q8_1-quantized reordered MoE activations for the dp4a prefill GEMM.
@@ -27,7 +27,7 @@ index 474dfc0..084994e 100644
      ggml_cl_buffer prealloc_moe_qa;   // int8 quants  [tok_slots * ne00]
      ggml_cl_buffer prealloc_topk_val;  // TOP_K stage-1 candidate values  [nrows * ncand]
      ggml_cl_buffer prealloc_topk_idx;  // TOP_K stage-1 candidate columns [nrows * ncand]
-@@ -1591,6 +1593,8 @@ struct ggml_backend_opencl_context {
+@@ -1599,6 +1601,8 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_mul_mv_q8_0_f32, kernel_mul_mv_q8_0_f32_flat;
      cl_kernel kernel_mul_mv_q8_0_f32_flat_mc = nullptr;
      cl_kernel kernel_mul_mv_q8_0_f32_flat_mc8 = nullptr;
@@ -36,7 +36,7 @@ index 474dfc0..084994e 100644
      cl_kernel kernel_mul_mat_q8_0_f32_kq_gen = nullptr;
      cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128 = nullptr;
      cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128_img = nullptr;
-@@ -6535,6 +6539,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -6622,6 +6626,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
          cl_program program_mc8 = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts + " -DN_COLS_Q8_0_MC=8");
          CL_CHECK((backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc8 = clCreateKernel(program_mc8, "kernel_mul_mv_q8_0_f32_flat_mc", &err), err));
          CL_CHECK(clReleaseProgram(program_mc8));
@@ -49,7 +49,7 @@ index 474dfc0..084994e 100644
          GGML_LOG_CONT(".");
      }
  
-@@ -47850,6 +47860,52 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -48296,6 +48306,52 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
          }
          case GGML_TYPE_Q8_0: {
  #ifdef GGML_OPENCL_SOA_Q
@@ -103,7 +103,7 @@ index 474dfc0..084994e 100644
                  backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc != nullptr) {
                  kernel = backend_ctx->kernel_mul_mv_q8_0_f32_flat_mc;
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
-index a8a1592..930eeaa 100644
+index a8a159221..930eeaa17 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
 @@ -364,3 +364,103 @@ kernel void kernel_mul_mv_q8_0_f32_flat_mc(

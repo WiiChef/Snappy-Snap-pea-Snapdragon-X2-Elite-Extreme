@@ -1,4 +1,4 @@
-From cc2b9d0584f441ea80d9c0dfce310ce0d8cb7a74 Mon Sep 17 00:00:00 2001
+From 5139b119f352303caa1871e8b6eb11986dbe9ab8 Mon Sep 17 00:00:00 2001
 From: snap-pea <snap-pea@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 08:14:22 -0400
 Subject: [PATCH 15/19] tests: f16 dk256 GQA8 FA cases for 2/4/8-query batches
@@ -10,10 +10,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 3 insertions(+), 1 deletion(-)
 
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index b580462..08e83f9 100644
+index 8d58b52cc..ae1e754f2 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11549,7 +11549,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11557,7 +11557,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
          // f16 KV decode (the MTP draft context); at kv=32768 f16 sits at the NMSE threshold for every kernel
          if (kv < 32768) {

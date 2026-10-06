@@ -1,4 +1,4 @@
-From e445d3290507ed8806e602054dce0c1cb90d3c14 Mon Sep 17 00:00:00 2001
+From bd785862dd6413d22dbc8adefd4a0caf9b0a0529 Mon Sep 17 00:00:00 2001
 From: snap-pea <snap-pea@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 05:35:24 -0400
 Subject: [PATCH 12/19] model: optional Q4_0 copy of the MTP draft head
@@ -20,7 +20,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 42 insertions(+), 1 deletion(-)
 
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index ab5e744..ec430b9 100644
+index ab5e744b5..ec430b9c7 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1946,6 +1946,43 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
@@ -68,7 +68,7 @@ index ab5e744..ec430b9 100644
  }
  
 diff --git a/src/llama-model.h b/src/llama-model.h
-index a0f9f11..50a1eb7 100644
+index a0f9f1142..50a1eb786 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -648,6 +648,7 @@ struct llama_model {
@@ -80,7 +80,7 @@ index a0f9f11..50a1eb7 100644
      struct ggml_tensor * output_norm_enc = nullptr;
  
 diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
-index 93143f3..4d441a8 100644
+index 93143f375..4d441a87a 100644
 --- a/src/models/qwen35moe.cpp
 +++ b/src/models/qwen35moe.cpp
 @@ -743,7 +743,10 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm

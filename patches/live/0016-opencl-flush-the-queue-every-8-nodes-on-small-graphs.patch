@@ -1,4 +1,4 @@
-From 4844dccff9c7614bc744ef1866416076ea3d1a78 Mon Sep 17 00:00:00 2001
+From 1d83240f7a268284dd40524bd55beb1680988f77 Mon Sep 17 00:00:00 2001
 From: snap-pea <snap-pea@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 08:48:00 -0400
 Subject: [PATCH 16/19] opencl: flush the queue every 8 nodes on small graphs
@@ -18,10 +18,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 15 insertions(+)
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index b11e929..4655c64 100644
+index 82037ff03..75313a3bb 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -17157,9 +17157,24 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
+@@ -17410,9 +17410,24 @@ static void ggml_backend_opencl_exec_graph_nodes(ggml_backend_t backend, ggml_cg
      // Feed the queue from a fast core; the driver's own threads were pinned at init.
      ggml_cl_pin_self pin;
  

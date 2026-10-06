@@ -1,4 +1,4 @@
-From e3f08eb579fe5f8c4d586e2812c93b6c30ee7cd0 Mon Sep 17 00:00:00 2001
+From 4be5f29ea4d28fb2977195a041bc1ad931ea2456 Mon Sep 17 00:00:00 2001
 From: snap-pea <snap-pea@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 21:15:46 -0400
 Subject: [PATCH 18/19] opencl: fixed-width (-DMC_NCOL=2..8) builds of the q8_0
@@ -14,10 +14,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 54 insertions(+), 8 deletions(-)
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 4655c64..d515dab 100644
+index 75313a3bb..9e9016bcb 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1600,6 +1600,8 @@ struct ggml_backend_opencl_context {
+@@ -1608,6 +1608,8 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_q8mc_quant_act = nullptr;           // dp4a verify GEMV: activation quantizer
      cl_kernel kernel_mul_mv_q8_0_q8a_dp4a_mc = nullptr;  // dp4a verify GEMV (2..8 columns)
      cl_kernel kernel_mul_mv_q8_0_q8a_dp4a_mc_lds = nullptr; // same, activations staged in local memory
@@ -26,7 +26,7 @@ index 4655c64..d515dab 100644
      cl_kernel kernel_fa_q8_d256_g8_dec = nullptr;        // q8_0 KV dk256 gqa8 decode FA split (row-per-lane QK)
      cl_kernel kernel_fa_f16_d256_g8_dec = nullptr;       // f16 KV twin (MTP draft context)
      cl_kernel kernel_mul_mat_q8_0_f32_kq_gen = nullptr;
-@@ -2052,6 +2054,7 @@ struct ggml_backend_opencl_context {
+@@ -2064,6 +2066,7 @@ struct ggml_backend_opencl_context {
      int q80_dp4a_narrow_max = 16;   // widest ne1 routed to the narrow tile
      cl_kernel kernel_gemv_noshuffle_q8_0_f32;
      cl_kernel kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk = nullptr; // small-M 2..8-column int8 split-K GEMV
@@ -34,7 +34,7 @@ index 4655c64..d515dab 100644
      cl_kernel kernel_gemv_noshuffle_q8_0_f32_splitk;  // split-K across WGs (small-M decode)
      cl_kernel kernel_gemm_noshuffle_q1_0_f32;
      cl_kernel kernel_gemv_noshuffle_q1_0_f32;
-@@ -6558,6 +6561,19 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -6645,6 +6648,19 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  GGML_LOG_WARN("ggml_opencl: kernel_mul_mv_q8_0_q8a_dp4a_mc_lds unavailable (err %d)\n", err);
                  backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc_lds = nullptr;
              }
@@ -54,7 +54,7 @@ index 4655c64..d515dab 100644
              backend_ctx->kernel_fa_f16_d256_g8_dec = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_fa_f16_d256_g8_dec", &err);
              if (err != CL_SUCCESS) {
                  GGML_LOG_WARN("ggml_opencl: kernel_fa_f16_d256_g8_dec unavailable (err %d)\n", err);
-@@ -9545,6 +9561,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -9672,6 +9688,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
              backend_ctx->kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk = nullptr;
          }
          CL_CHECK(clReleaseProgram(prog));
@@ -70,7 +70,7 @@ index 4655c64..d515dab 100644
          GGML_LOG_CONT(".");
      }
  
-@@ -38908,7 +38933,9 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
+@@ -39333,7 +39358,9 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
              backend_ctx->prealloc_splitk_partial.allocate(context, (size_t) ksplit * ncol * M * sizeof(float));
              cl_mem partial = backend_ctx->prealloc_splitk_partial.buffer;
  
@@ -81,7 +81,7 @@ index 4655c64..d515dab 100644
              CL_CHECK(clSetKernelArg(kd, 0, sizeof(cl_mem), &q_img));
              CL_CHECK(clSetKernelArg(kd, 1, sizeof(cl_mem), &extra0_q8_0->d));
              CL_CHECK(clSetKernelArg(kd, 2, sizeof(cl_mem), &qa));
-@@ -48061,6 +48088,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -48507,6 +48534,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                                       (size_t) ncol * ne00 <= 16384;
                  cl_kernel km = use_lds ? backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc_lds
                                         : backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc;
@@ -94,7 +94,7 @@ index 4655c64..d515dab 100644
                  CL_CHECK(clSetKernelArg(km,  1, sizeof(cl_mem),   &extra0_q8_0->d));
                  CL_CHECK(clSetKernelArg(km,  2, sizeof(cl_mem),   &qa));
 diff --git a/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q8_0_f32.cl b/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q8_0_f32.cl
-index ba976de..bdf9b84 100644
+index ba976de10..bdf9b840d 100644
 --- a/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q8_0_f32.cl
 +++ b/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q8_0_f32.cl
 @@ -129,7 +129,13 @@
@@ -138,7 +138,7 @@ index ba976de..bdf9b84 100644
                  for (uint i = 0; i + 1 < nsg; ++i) v += red[(64 * i + lid) * NS_MC_MAX + c];
                  partial[((ulong) kslice * ncol + c) * M + gid] = v;
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
-index cb814b9..4d0f419 100644
+index cb814b99d..4d0f41906 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
 @@ -375,7 +375,15 @@ kernel void kernel_mul_mv_q8_0_f32_flat_mc(

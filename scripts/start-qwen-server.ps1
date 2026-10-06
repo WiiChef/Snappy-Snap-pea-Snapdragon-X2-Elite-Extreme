@@ -27,6 +27,10 @@ $logDir = 'C:\NInfer\logs'
 # Agent bench 2026-10-05: 64k Q8_0 42.6 tok/s (acc 77.8%) -> 96k Q4_0 43.9 (acc 80.5%).
 $env:LLAMA_MTP_DRAFT_HEAD_Q4 = '1'
 $env:LLAMA_MTP_DRAFT_VOCAB   = '98304'
+# 2026-10-06 (build mtp-smallbatch 46b7cc1 = qualcomm fork 8085b4e + our kernels): verify-width MoE via the per-token
+# f32 GEMV (+3.2% decode, agentbench 10/10) and the alds4 q8_0 dp4a prefill GEMM (+4.6% pp, identical output).
+$env:GGML_OPENCL_MOE_GEMV_MAX_TOK = '8'
+$env:GGML_OPENCL_Q8_0_DP4A_ALDS4 = '1'
 
 function Test-Listening { [bool](Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) }
 

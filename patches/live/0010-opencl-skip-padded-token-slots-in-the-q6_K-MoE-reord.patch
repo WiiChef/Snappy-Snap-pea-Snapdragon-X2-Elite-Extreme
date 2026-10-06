@@ -1,4 +1,4 @@
-From c42a99a1923035a17b6731d0eace28f0742560fd Mon Sep 17 00:00:00 2001
+From 2cfc11e04ac91d2a5e9c62175ac969f57ad4540e Mon Sep 17 00:00:00 2001
 From: snap-pea <snap-pea@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 04:12:42 -0400
 Subject: [PATCH 10/19] opencl: skip padded token slots in the q6_K MoE
@@ -20,10 +20,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 69 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 12a9c88..3293d01 100644
+index d1861165a..959abe14f 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1686,6 +1686,7 @@ struct ggml_backend_opencl_context {
+@@ -1694,6 +1694,7 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_gemv_moe_q4_k_f32_ns_wimg = nullptr;  // weight-as-texture MoE decode GEMV (opt-in)
      cl_kernel kernel_gemm_moe_q4_k_q8_1_dp4a = nullptr;    // dp4a (int8) prefill GEMM variant
      cl_kernel kernel_moe_reorder_quant_a_q8_1;   // fused reorder + q8_1 quant for the dp4a GEMM
@@ -31,7 +31,7 @@ index 12a9c88..3293d01 100644
      cl_kernel kernel_gemm_moe_q8_1_dp4a_q80 = nullptr;   // generic dp4a MoE GEMM (MOE_QT=80), opt-in
      cl_kernel kernel_moe_expand_scale_q8_0 = nullptr;    // q8_0 per-block d -> uniform scale[16]
      cl_kernel kernel_gemm_moe_q8_1_dp4a_q50 = nullptr;   // generic dp4a MoE GEMM (MOE_QT=50, q5_0), opt-in
-@@ -10798,6 +10799,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -10950,6 +10951,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
              build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts);
  
          CL_CHECK((backend_ctx->kernel_moe_reorder_quant_a_q8_1 = clCreateKernel(prog, "kernel_moe_reorder_quant_a_q8_1", &err), err));
@@ -40,7 +40,7 @@ index 12a9c88..3293d01 100644
          CL_CHECK(clReleaseProgram(prog));
          GGML_LOG_CONT(".");
      }
-@@ -52550,7 +52553,13 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
+@@ -53110,7 +53113,13 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
  
                          // fused reorder + q8_1 quant from the original activations
                          const cl_uint n_kblocks = (cl_uint)(ne00 / 32);
@@ -56,7 +56,7 @@ index 12a9c88..3293d01 100644
                          CL_CHECK(clSetKernelArg(rq, 1, sizeof(cl_mem),         &buf_src2));
                          CL_CHECK(clSetKernelArg(rq, 2, sizeof(cl_mem),         &backend_ctx->prealloc_moe_qa.buffer));
 diff --git a/ggml/src/ggml-opencl/kernels/moe_reorder_quant_a_q8_1.cl b/ggml/src/ggml-opencl/kernels/moe_reorder_quant_a_q8_1.cl
-index 0d16f3a..1d26694 100644
+index 0d16f3abd..1d2669429 100644
 --- a/ggml/src/ggml-opencl/kernels/moe_reorder_quant_a_q8_1.cl
 +++ b/ggml/src/ggml-opencl/kernels/moe_reorder_quant_a_q8_1.cl
 @@ -62,3 +62,62 @@ __kernel void kernel_moe_reorder_quant_a_q8_1(

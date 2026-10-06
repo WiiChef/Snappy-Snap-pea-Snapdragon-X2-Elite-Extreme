@@ -7,7 +7,7 @@ Getting **Qwen3.6-35B-A3B** with all-**Q6_K** experts to decode as fast as possi
 **MTP speculative decoding**.
 
 This repo isn't llama.cpp. It records what we changed on top of Qualcomm's llama.cpp fork
-([qualcomm/llama.cpp](https://github.com/qualcomm/llama.cpp), branch `opencl/x2-unified-everything` @ `fb62b8a`):
+([qualcomm/llama.cpp](https://github.com/qualcomm/llama.cpp), branch `opencl/x2-unified-everything` @ `8085b4e`, 2026-10-05):
 
 - the kernels
 - the patch series
@@ -23,17 +23,22 @@ Agent-prompt bench: 4 coding and agent prompts × 2 seeds, temp 0.6, 400 generat
 |---|---|
 | Plain decode (no speculation) | 31.9 |
 | MTP on the stock fork | 39.6 |
-| **MTP + snap-pea** | **46.4** (+45% vs plain, +17% vs stock MTP) |
+| **MTP + snap-pea** | **≈47.8** (+50% vs plain, +21% vs stock MTP) |
 | MTP decode after an 85k-token prompt | 15.2 → **26.5** |
 
-- **Prefill:** about 550 tok/s from an empty context, 473 tok/s at 8k and 332 tok/s at 32k, close to the GPU's compute peak.
-- **Accuracy:** agentbench 10/10 on two runs. The draft-side changes never change the verified output; drafts only decide how many tokens get checked per round.
+- **Prefill:** about 550 tok/s from an empty context, 473 tok/s at 8k and 332 tok/s at 32k. The alds4 GEMM (below) adds another +4.6% on the bench prompts.
+- **Accuracy:** agentbench 10/10 on the current build and on every earlier build.
+  - The draft-side changes never change the verified output; drafts only decide how many tokens get checked per round.
+  - The per-token MoE GEMV for verify batches does change the numbers slightly, because it keeps activations in fp32 instead of quantizing them to 8-bit. That is the same math as normal single-token decode.
 
-Where the time goes per MTP round:
-- **About 68% verifying the drafted tokens.**
-  - The MoE expert reads run at the bandwidth floor for the distinct experts each batch touches.
-  - The dense GEMVs reach about 65–80% of measured streaming bandwidth.
-- **About 16% drafting.** That's GPU work of about 1.5 ms per step, not host overhead.
+Where the GPU time goes during MTP decode (profiled on a code prompt, before the per-token MoE switch):
+
+| Share | What |
+|---|---|
+| 38% | MoE expert matmuls in verify batches, plus their routing reorder. The batched dp4a GEMM ran at roughly half the bandwidth of the single-token GEMV, which is what the per-token switch fixes. |
+| 10% | Target lm_head in verify, at about 68 GB/s against 128 GB/s single-column. This is the largest remaining target. |
+| 6% | Q4_0 draft head, near bandwidth. |
+| Remainder | Dense projections, GDN layers and attention. Every remaining piece is small. |
 
 ## Model and config
 
@@ -45,6 +50,7 @@ llama-server -m scan-all-q6k.gguf -ngl 99 -fa on -ub 512 -b 2048 -t 8 -np 1 \
   -ctk q8_0 -ctv q8_0 -c 98304 --cache-ram 4096 \
   --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 0
 env: LLAMA_MTP_DRAFT_HEAD_Q4=1  LLAMA_MTP_DRAFT_VOCAB=98304
+     GGML_OPENCL_MOE_GEMV_MAX_TOK=8  GGML_OPENCL_Q8_0_DP4A_ALDS4=1
 ```
 
 Full launcher: [scripts/start-qwen-server.ps1](scripts/start-qwen-server.ps1).
@@ -57,7 +63,7 @@ Memory limits:
 ## Kernels and changes
 
 The code each kernel adds is extracted in [kernels/](kernels/). The full, applicable series is in
-[patches/live](patches/live) (`git am` onto `fb62b8a`). Everything is on by default unless marked opt-in, and each has an env opt-out.
+[patches/live](patches/live) (`git am` onto `8085b4e`). Everything is on by default unless marked opt-in, and each has an env opt-out.
 
 | Change | What it does | Opt-out |
 |---|---|---|
@@ -74,10 +80,19 @@ The code each kernel adds is extracted in [kernels/](kernels/). The full, applic
 | FA PV unroll | Unrolls the PV loop of the dk=256 decode kernel by 2. Same arithmetic order. +1.5–2% decode at 64k context; 4 is flat and 8 is slower. | `GGML_OPENCL_FA_PV_UNROLL=n` (1 = off) |
 | Timing | Prints the host/GPU split of draft time at exit. | opt-in: `GGML_MTP_TIMING=1` |
 
-[patches/experimental](patches/experimental) holds two opt-in experiments that measured no gain:
+### Fork options we turn on
 
-- **Chained drafting** (patches 0001–0002, `LLAMA_MTP_CHAIN=k`; they apply on live patch 0017). Runs k draft steps in one graph. The drafts are identical but not faster: 41.3 vs 43.7 tok/s, because the graph is rebuilt every round.
-- **Probabilistic MTP drafting** (patch 0003, `--spec-draft-sampling probabilistic`). A port of upstream #27694 with rejection-sampling verify, written against the fork at `8085b4e`. 45.1 tok/s at p-min 0.8 vs 45.4 greedy.
+These two options are already in Qualcomm's fork but are off by default on the X2-90. We found them by auditing the default logic of all 264 `GGML_OPENCL_*` options that touch this model.
+
+| Option | What it does | Effect |
+|---|---|---|
+| `GGML_OPENCL_MOE_GEMV_MAX_TOK=8` | Sends 2–8-token MoE batches (every MTP verify) to the per-token f32 GEMV instead of the dp4a GEMM. The GEMM path is only defaulted on for the Adreno 850. | +3.2% decode (48.0 vs 46.5); agentbench 10/10 |
+| `GGML_OPENCL_Q8_0_DP4A_ALDS4=1` | Q8_0 dp4a prefill GEMM variant. | +4.6% prompt throughput, identical output |
+
+[patches/experimental](patches/experimental) holds two opt-in experiments that measured no gain. They apply on top of patches/live:
+
+- **Chained drafting** (patches 0001–0002, `LLAMA_MTP_CHAIN=k`). Runs k draft steps in one graph. The drafts are identical but not faster: 41.3 vs 43.7 tok/s, because the graph is rebuilt every round.
+- **Probabilistic MTP drafting** (patch 0003, `--spec-draft-sampling probabilistic`). A port of upstream #27694 with rejection-sampling verify. 45.1 tok/s at p-min 0.8 vs 45.4 greedy.
 
 ## What didn't help
 
@@ -105,10 +120,22 @@ All of these are measured, with details in [RESULTS.md](RESULTS.md).
 **Runtime and outside options:**
 - Recordable queues: they never engage with flash attention.
 - Qualcomm's precompiled kernel library (`adreno-opencl-kernels.dll`): **34.1 vs 45.3**. Don't ship it next to these kernels.
-- Merging the fork's commits up to Oct 5: neutral.
+- Merging the fork's commits up to Oct 5: neutral by itself, with token-identical output. It is needed for the MoE GEMV option above.
+- Other opt-in fork options, measured against the live config (47.6 tok/s / 337.5 pp):
+  - `FUSE_RMS_ROPE_SET_ROWS`: 47.9
+  - `ADRENO_USE_LARGE_BUFFER`: 47.1
+  - `XMEM_SDPA`: 46.6
+  - `Q8_DENSE_DP4A_WIMG`: 46.4 / 343 pp
+  - `MOE_RAGGED_STATICIDX`: 46.2
+- The fork's fused gate+up MoE GEMV exists only for q4_K, so it can't be used with Q6_K experts.
+- An lm_head row-group loop in the local-memory GEMV raised register use past the 512-item work-group and failed to enqueue, so it was reverted.
 - Fewer active experts (6 or 4): KLD 7–25× worse, rejected for accuracy.
 - Smaller expert quants: rejected for accuracy, and they gave no real speed gain here.
-- Hexagon NPU: llama.cpp can't run GGUF on it. Running it alongside the GPU server also corrupted the GPU model's output.
+- Hexagon NPU, tested with upstream's Hexagon backend (`43fe9c6`, Q6_K supported, skel test-signed):
+  - Full model on the NPU: pp512 314 and tg32 18.2, against roughly 550 and 32 on the GPU.
+  - MoE MUL_MAT_ID: ties the GPU's per-token GEMV at 1–4 tokens (53/100/198 µs) and is 4–5× slower at 5–8 tokens.
+  - A GPU+NPU split would only help if both ran concurrently, which llama.cpp's scheduler doesn't do.
+  - Running an NPU process alongside the GPU server corrupted the GPU model's output.
 
 ## Scripts
 

@@ -1,4 +1,4 @@
-From c25898df3092e6f227503d70e285bd0e9bb22e20 Mon Sep 17 00:00:00 2001
+From b146336c5de2d81f6a639927da6d2ca0ec6036e1 Mon Sep 17 00:00:00 2001
 From: snap-pea <snap-pea@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 05:46:19 -0400
 Subject: [PATCH 13/19] model: print the MTP draft-head requantization line
@@ -10,7 +10,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index ec430b9..bb9f897 100644
+index ec430b9c7..bb9f8972d 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1976,7 +1976,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {

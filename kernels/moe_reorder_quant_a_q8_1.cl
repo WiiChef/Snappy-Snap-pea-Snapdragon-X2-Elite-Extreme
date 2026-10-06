@@ -1,4 +1,4 @@
-// snap-pea additions to ggml/src/ggml-opencl/kernels/moe_reorder_quant_a_q8_1.cl (qualcomm/llama.cpp @ fb62b8a).
+// snap-pea additions to ggml/src/ggml-opencl/kernels/moe_reorder_quant_a_q8_1.cl (qualcomm/llama.cpp opencl/x2-unified-everything @ 8085b4e).
 // Extracted from the patch series in ../patches/live; hunks are separated by '// ----'.
 
 // ----

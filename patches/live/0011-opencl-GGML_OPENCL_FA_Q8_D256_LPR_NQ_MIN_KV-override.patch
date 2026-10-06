@@ -1,4 +1,4 @@
-From 687c4cdf917076a977662bf456c2efd845108d53 Mon Sep 17 00:00:00 2001
+From 78674d38393e9a862274ada23ecbc62f8429093f Mon Sep 17 00:00:00 2001
 From: snap-pea <snap-pea@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 04:35:40 -0400
 Subject: [PATCH 11/19] opencl: GGML_OPENCL_FA_Q8_D256_LPR_NQ_MIN_KV overrides
@@ -10,10 +10,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 5 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 3293d01..3f8c621 100644
+index 959abe14f..77b9d2b6f 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -33173,7 +33173,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -33583,7 +33583,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      // group) instead of the decompose path, whose cost grows ~10x faster with depth
      // (X2-90 Qwen3.6-35B-A3B pp5: +51 ms per batch at d32768 vs +5.5 ms for a decode step).
      // Opt out: GGML_OPENCL_FA_Q8_D256_LPR_NQ=0.

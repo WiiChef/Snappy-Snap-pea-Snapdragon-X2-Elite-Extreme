@@ -1,4 +1,4 @@
-From 29de3d1c1f98d518c257a2c0f7db4ee500b53d0e Mon Sep 17 00:00:00 2001
+From 718aaea492b82331809d39325dc034b00eea5c0e Mon Sep 17 00:00:00 2001
 From: snap-pea <snap-pea@users.noreply.github.com>
 Date: Sun, 4 Oct 2026 08:30:26 -0400
 Subject: [PATCH 04/19] mtp: reduced-vocabulary draft head for qwen35moe;
@@ -18,10 +18,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 20 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 481f38f..474dfc0 100644
+index fe4d70786..48ed71211 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -44731,8 +44731,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -45175,8 +45175,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
          }
  
          // q8_0 x fp32
@@ -34,7 +34,7 @@ index 481f38f..474dfc0 100644
                  return;
          }
 diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
-index bdf7726..93143f3 100644
+index bdf772625..93143f375 100644
 --- a/src/models/qwen35moe.cpp
 +++ b/src/models/qwen35moe.cpp
 @@ -733,7 +733,23 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm

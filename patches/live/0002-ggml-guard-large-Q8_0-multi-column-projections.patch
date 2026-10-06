@@ -1,4 +1,4 @@
-From 15ff684ebd9ce3e999e9d5d15713390d60704d24 Mon Sep 17 00:00:00 2001
+From 9d19e5d27c8c6935f6170f58c3e0e1c68dbba577 Mon Sep 17 00:00:00 2001
 From: snap-pea <snap-pea@users.noreply.github.com>
 Date: Sun, 4 Oct 2026 06:10:50 -0400
 Subject: [PATCH 02/19] ggml : guard large Q8_0 multi-column projections
@@ -9,10 +9,10 @@ Assisted-by: Codex
  1 file changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 481f38f..b71b136 100644
+index fe4d70786..62caa1cc8 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -47848,11 +47848,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -48294,11 +48294,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
          }
          case GGML_TYPE_Q8_0: {
  #ifdef GGML_OPENCL_SOA_Q

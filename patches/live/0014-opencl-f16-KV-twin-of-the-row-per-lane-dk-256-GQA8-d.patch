@@ -1,4 +1,4 @@
-From f563561f3675091c0597245ec0144e3591de5ccf Mon Sep 17 00:00:00 2001
+From 14a7187d0cb959a53068a13344bd501a66226525 Mon Sep 17 00:00:00 2001
 From: snap-pea <snap-pea@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 07:38:19 -0400
 Subject: [PATCH 14/19] opencl: f16-KV twin of the row-per-lane dk=256 GQA8
@@ -24,10 +24,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 170 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 3f8c621..b11e929 100644
+index 77b9d2b6f..82037ff03 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1601,6 +1601,7 @@ struct ggml_backend_opencl_context {
+@@ -1609,6 +1609,7 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_mul_mv_q8_0_q8a_dp4a_mc = nullptr;  // dp4a verify GEMV (2..8 columns)
      cl_kernel kernel_mul_mv_q8_0_q8a_dp4a_mc_lds = nullptr; // same, activations staged in local memory
      cl_kernel kernel_fa_q8_d256_g8_dec = nullptr;        // q8_0 KV dk256 gqa8 decode FA split (row-per-lane QK)
@@ -35,7 +35,7 @@ index 3f8c621..b11e929 100644
      cl_kernel kernel_mul_mat_q8_0_f32_kq_gen = nullptr;
      cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128 = nullptr;
      cl_kernel kernel_mul_mat_q8_0_f32_gqa8_dk128_img = nullptr;
-@@ -6557,6 +6558,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -6644,6 +6645,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                  GGML_LOG_WARN("ggml_opencl: kernel_mul_mv_q8_0_q8a_dp4a_mc_lds unavailable (err %d)\n", err);
                  backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc_lds = nullptr;
              }
@@ -47,7 +47,7 @@ index 3f8c621..b11e929 100644
              backend_ctx->kernel_fa_q8_d256_g8_dec = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_fa_q8_d256_g8_dec", &err);
              if (err != CL_SUCCESS) {
                  GGML_LOG_WARN("ggml_opencl: kernel_fa_q8_d256_g8_dec unavailable (err %d)\n", err);
-@@ -34070,7 +34076,20 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -34484,7 +34490,20 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
              !use_local_tile &&  // local-tile dispatches its own grid, skip MQ FD-split
              n_kv >= mq_n_kv_floor &&
              backend_ctx->fa.f32_merge.count(dk_dv) > 0) {
@@ -70,7 +70,7 @@ index 3f8c621..b11e929 100644
                  backend_ctx->fa.f32_f16_q1_local_mq_split_g8.count(dk_dv) > 0) {
                  fd_k_split = backend_ctx->fa.f32_f16_q1_local_mq_split_g8.at(dk_dv);
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
-index 42f480e..cb814b9 100644
+index 42f480e22..cb814b99d 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
 @@ -734,4 +734,150 @@ kernel void kernel_fa_q8_d256_g8_dec(
@@ -225,10 +225,10 @@ index 42f480e..cb814b9 100644
 +}
  #endif // cl_khr_integer_dot_product
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 622304a..b580462 100644
+index 3d75a6f4f..8d58b52cc 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11547,6 +11547,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11555,6 +11555,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          for (int nb : { 1, 2, 4, 8, }) {
              test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, { 8, 1 }, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
          }

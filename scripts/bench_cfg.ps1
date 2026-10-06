@@ -1,9 +1,9 @@
-param([string]$Name, [string]$Spec = '', [string]$Exe = 'D:\llm\build\qc-mtp\bin\llama-server.exe')
+param([string]$Name, [string]$Spec = '', [string]$Exe = 'D:\llm\build\qc-mtp\bin\llama-server.exe', [string]$Ctx = '98304')
 # Live-server settings (C:\NInfer\start-qwen-server.ps1) on port 8099 with a given speculative config.
 # Each prompt runs twice with fixed seeds (1, 2); prints decode tok/s and draft acceptance.
 $args0 = @('-m','D:\llm\scan\scan-all-q6k.gguf','-ngl','99','-fa','on','-ub','512','-b','2048','-t','8','-np','1',
   '--temp','0.6','--top-p','0.95','--top-k','20','--min-p','0','--presence-penalty','0',
-  '-c','98304','--host','127.0.0.1','--port','8099','--chat-template-file','D:\llm\agentbench\templates\official.jinja')
+  '-c',$Ctx,'--host','127.0.0.1','--port','8099','--chat-template-file','D:\llm\agentbench\templates\official.jinja')
 if ($Spec -ne '') { $args0 += ($Spec -split ' ') }
 Set-Location (Split-Path -Parent $Exe)
 $job = Start-Job -ScriptBlock { param($e, $a) pwsh -NoProfile -File D:\ninfer\gpu-run.ps1 model min=25 $e @a 2>&1 | Out-Null } -ArgumentList $Exe, (,$args0)
