@@ -173,7 +173,15 @@ kernel void kernel_mul_mv_q8_0_f32_flat_mc(
 // ============================================================================
 #ifdef cl_khr_integer_dot_product
 #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
+// MC_NCOL (compile-time width 2..8) sizes the accumulators for the actual verify width and folds the
+// column bound; without it the kernels take ncol at run time and reserve 8 columns.
+#ifdef MC_NCOL
+#define Q8MC_MAXC MC_NCOL
+#define Q8MC_NCOL MC_NCOL
+#else
 #define Q8MC_MAXC 8
+#define Q8MC_NCOL ncol
+#endif
 #ifndef MC_R0
 #define MC_R0 4
 #endif
@@ -247,7 +255,7 @@ kernel void kernel_mul_mv_q8_0_q8a_dp4a_mc(
         }
         #pragma unroll
         for (int c = 0; c < Q8MC_MAXC; c++) {
-            if (c >= ncol) break;
+            if (c >= Q8MC_NCOL) break;
             const uint2 a  = as_uint2(vload8(0, qa + (ulong)c*ne00 + ib*QK8_0 + il*NB_Q8_0));
             const float dc = da[c*nb + ib];
             for (int r = 0; r < MC_R0; r++) {
@@ -260,7 +268,7 @@ kernel void kernel_mul_mv_q8_0_q8a_dp4a_mc(
 
     #pragma unroll
     for (int c = 0; c < Q8MC_MAXC; c++) {
-        if (c >= ncol) break;
+        if (c >= Q8MC_NCOL) break;
         global float * dst_f32 = (global float *) dst + (ulong)c*ne0;
         for (int r = 0; r < MC_R0; r++) {
             const float tot = sub_group_reduce_add(sumf[c][r]);
@@ -328,7 +336,7 @@ kernel void kernel_mul_mv_q8_0_q8a_dp4a_mc_lds(
         }
         #pragma unroll
         for (int c = 0; c < Q8MC_MAXC; c++) {
-            if (c >= ncol) break;
+            if (c >= Q8MC_NCOL) break;
             const uint2 a  = vload2(0, qa_l + (c*ne00 + ib*QK8_0 + il*NB_Q8_0) / 4);
             const float dc = da_l[c*nb + ib];
             for (int r = 0; r < MC_R0; r++) {
@@ -341,7 +349,7 @@ kernel void kernel_mul_mv_q8_0_q8a_dp4a_mc_lds(
 
     #pragma unroll
     for (int c = 0; c < Q8MC_MAXC; c++) {
-        if (c >= ncol) break;
+        if (c >= Q8MC_NCOL) break;
         global float * dst_f32 = (global float *) dst + (ulong)c*ne0;
         for (int r = 0; r < MC_R0; r++) {
             const float tot = sub_group_reduce_add(sumf[c][r]);
@@ -506,6 +514,9 @@ kernel void kernel_fa_q8_d256_g8_dec(
 
         const int nr = min(64, kv_end - t0);
         const global char * vrow = v_base + (ulong) t0 * v_nb1 + vb * FAD_BLK;
+#ifdef FAD_PV_UNROLL
+        #pragma unroll FAD_PV_UNROLL
+#endif
         for (int i = 0; i < nr; ++i) {
             const global char * vblk = vrow + (ulong) i * v_nb1;
             const float  vd = vload_half(0, (const global half *) vblk);

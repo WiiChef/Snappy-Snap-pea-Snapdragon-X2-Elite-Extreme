@@ -1,0 +1,198 @@
+From e3f08eb579fe5f8c4d586e2812c93b6c30ee7cd0 Mon Sep 17 00:00:00 2001
+From: snap-pea <snap-pea@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 21:15:46 -0400
+Subject: [PATCH 18/19] opencl: fixed-width (-DMC_NCOL=2..8) builds of the q8_0
+ dp4a verify GEMVs
+
+The mc, mc_lds and split-K kernels reserved accumulators and local reduction memory for 8 columns at every verify width. One build per width sizes them for the actual width and folds the column bound; arithmetic unchanged (identical outputs). Agent bench 45.4 -> 46.4 tok/s, faster on all 8 runs. Opt out: GGML_OPENCL_Q8_MC_FIXED=0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-opencl/ggml-opencl.cpp          | 34 ++++++++++++++++++-
+ .../kernels/gemv_noshuffle_q8_0_f32.cl        | 12 +++++--
+ .../kernels/mul_mv_q8_0_f32_flat.cl           | 16 ++++++---
+ 3 files changed, 54 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 4655c64..d515dab 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1600,6 +1600,8 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_q8mc_quant_act = nullptr;           // dp4a verify GEMV: activation quantizer
+     cl_kernel kernel_mul_mv_q8_0_q8a_dp4a_mc = nullptr;  // dp4a verify GEMV (2..8 columns)
+     cl_kernel kernel_mul_mv_q8_0_q8a_dp4a_mc_lds = nullptr; // same, activations staged in local memory
++    cl_kernel kernel_mul_mv_q8_0_q8a_dp4a_mc_w[9]     = {}; // per-width builds (-DMC_NCOL=n), n = 2..8
++    cl_kernel kernel_mul_mv_q8_0_q8a_dp4a_mc_lds_w[9] = {};
+     cl_kernel kernel_fa_q8_d256_g8_dec = nullptr;        // q8_0 KV dk256 gqa8 decode FA split (row-per-lane QK)
+     cl_kernel kernel_fa_f16_d256_g8_dec = nullptr;       // f16 KV twin (MTP draft context)
+     cl_kernel kernel_mul_mat_q8_0_f32_kq_gen = nullptr;
+@@ -2052,6 +2054,7 @@ struct ggml_backend_opencl_context {
+     int q80_dp4a_narrow_max = 16;   // widest ne1 routed to the narrow tile
+     cl_kernel kernel_gemv_noshuffle_q8_0_f32;
+     cl_kernel kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk = nullptr; // small-M 2..8-column int8 split-K GEMV
++    cl_kernel kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk_w[9] = {}; // per-width builds (-DMC_NCOL=n)
+     cl_kernel kernel_gemv_noshuffle_q8_0_f32_splitk;  // split-K across WGs (small-M decode)
+     cl_kernel kernel_gemm_noshuffle_q1_0_f32;
+     cl_kernel kernel_gemv_noshuffle_q1_0_f32;
+@@ -6558,6 +6561,19 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 GGML_LOG_WARN("ggml_opencl: kernel_mul_mv_q8_0_q8a_dp4a_mc_lds unavailable (err %d)\n", err);
+                 backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc_lds = nullptr;
+             }
++            // fixed-width builds of the verify GEMVs (accumulators sized for the actual width).
++            // Opt out: GGML_OPENCL_Q8_MC_FIXED=0.
++            if (!ggml_cl_env_flag_zero("GGML_OPENCL_Q8_MC_FIXED") && backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc != nullptr) {
++                for (int n = 2; n <= 8; ++n) {
++                    cl_program pw = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts + " -DMC_NCOL=" + std::to_string(n));
++                    cl_int e1 = CL_SUCCESS, e2 = CL_SUCCESS;
++                    cl_kernel k1 = clCreateKernel(pw, "kernel_mul_mv_q8_0_q8a_dp4a_mc", &e1);
++                    cl_kernel k2 = clCreateKernel(pw, "kernel_mul_mv_q8_0_q8a_dp4a_mc_lds", &e2);
++                    backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc_w[n]     = e1 == CL_SUCCESS ? k1 : nullptr;
++                    backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc_lds_w[n] = e2 == CL_SUCCESS ? k2 : nullptr;
++                    CL_CHECK(clReleaseProgram(pw));
++                }
++            }
+             backend_ctx->kernel_fa_f16_d256_g8_dec = clCreateKernel(backend_ctx->program_mul_mv_q8_0_f32_flat, "kernel_fa_f16_d256_g8_dec", &err);
+             if (err != CL_SUCCESS) {
+                 GGML_LOG_WARN("ggml_opencl: kernel_fa_f16_d256_g8_dec unavailable (err %d)\n", err);
+@@ -9545,6 +9561,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+             backend_ctx->kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk = nullptr;
+         }
+         CL_CHECK(clReleaseProgram(prog));
++        if (!ggml_cl_env_flag_zero("GGML_OPENCL_Q8_MC_FIXED") && backend_ctx->kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk != nullptr) {
++            for (int n = 2; n <= 8; ++n) {
++                cl_program pw = build_program_from_source(backend_ctx, kernel_src_CL_gemv_general.c_str(), CL_gemv_compile_opts + " -DMC_NCOL=" + std::to_string(n));
++                cl_int e1 = CL_SUCCESS;
++                cl_kernel k1 = clCreateKernel(pw, "kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk", &e1);
++                backend_ctx->kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk_w[n] = e1 == CL_SUCCESS ? k1 : nullptr;
++                CL_CHECK(clReleaseProgram(pw));
++            }
++        }
+         GGML_LOG_CONT(".");
+     }
+ 
+@@ -38908,7 +38933,9 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
+             backend_ctx->prealloc_splitk_partial.allocate(context, (size_t) ksplit * ncol * M * sizeof(float));
+             cl_mem partial = backend_ctx->prealloc_splitk_partial.buffer;
+ 
+-            cl_kernel kd = backend_ctx->kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk;
++            cl_kernel kd = backend_ctx->kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk_w[ncol] != nullptr
++                         ? backend_ctx->kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk_w[ncol]
++                         : backend_ctx->kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk;
+             CL_CHECK(clSetKernelArg(kd, 0, sizeof(cl_mem), &q_img));
+             CL_CHECK(clSetKernelArg(kd, 1, sizeof(cl_mem), &extra0_q8_0->d));
+             CL_CHECK(clSetKernelArg(kd, 2, sizeof(cl_mem), &qa));
+@@ -48061,6 +48088,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+                                      (size_t) ncol * ne00 <= 16384;
+                 cl_kernel km = use_lds ? backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc_lds
+                                        : backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc;
++                {
++                    cl_kernel kw = use_lds ? backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc_lds_w[ncol]
++                                           : backend_ctx->kernel_mul_mv_q8_0_q8a_dp4a_mc_w[ncol];
++                    if (kw != nullptr) km = kw;
++                }
+                 CL_CHECK(clSetKernelArg(km,  0, sizeof(cl_mem),   &extra0_q8_0->q));
+                 CL_CHECK(clSetKernelArg(km,  1, sizeof(cl_mem),   &extra0_q8_0->d));
+                 CL_CHECK(clSetKernelArg(km,  2, sizeof(cl_mem),   &qa));
+diff --git a/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q8_0_f32.cl b/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q8_0_f32.cl
+index ba976de..bdf9b84 100644
+--- a/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q8_0_f32.cl
++++ b/ggml/src/ggml-opencl/kernels/gemv_noshuffle_q8_0_f32.cl
+@@ -129,7 +129,13 @@
+ // ============================================================================
+ #ifdef cl_khr_integer_dot_product
+ #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
++#ifdef MC_NCOL
++#define NS_MC_MAX MC_NCOL
++#define NS_MC_NCOL MC_NCOL
++#else
+ #define NS_MC_MAX 8
++#define NS_MC_NCOL ncol
++#endif
+ #ifdef ADRENO_GPU
+ REQD_SUBGROUP_SIZE_64
+ #endif
+@@ -174,7 +180,7 @@ __kernel void kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk(
+         const float dw = convert_float(src0_d[gid_s + k * M]);
+         #pragma unroll
+         for (int c = 0; c < NS_MC_MAX; ++c) {
+-            if (c < ncol) {
++            if (c < NS_MC_NCOL) {
+                 const uint8 a = vload8(c * nbk + k, qa);
+                 int acc = dot_acc_sat_4x8packed_ss_int(w0, a.s0, 0);
+                 acc = dot_acc_sat_4x8packed_ss_int(w1, a.s1, acc);
+@@ -193,14 +199,14 @@ __kernel void kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk(
+     if (groupId > 0) {
+         #pragma unroll
+         for (int c = 0; c < NS_MC_MAX; ++c) {
+-            if (c < ncol) red[(64 * (groupId - 1) + lid) * NS_MC_MAX + c] = total[c];
++            if (c < NS_MC_NCOL) red[(64 * (groupId - 1) + lid) * NS_MC_MAX + c] = total[c];
+         }
+     }
+     barrier(CLK_LOCAL_MEM_FENCE);
+     if (groupId == 0 && gid < M) {
+         #pragma unroll
+         for (int c = 0; c < NS_MC_MAX; ++c) {
+-            if (c < ncol) {
++            if (c < NS_MC_NCOL) {
+                 float v = total[c];
+                 for (uint i = 0; i + 1 < nsg; ++i) v += red[(64 * i + lid) * NS_MC_MAX + c];
+                 partial[((ulong) kslice * ncol + c) * M + gid] = v;
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
+index cb814b9..4d0f419 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_q8_0_f32_flat.cl
+@@ -375,7 +375,15 @@ kernel void kernel_mul_mv_q8_0_f32_flat_mc(
+ // ============================================================================
+ #ifdef cl_khr_integer_dot_product
+ #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
++// MC_NCOL (compile-time width 2..8) sizes the accumulators for the actual verify width and folds the
++// column bound; without it the kernels take ncol at run time and reserve 8 columns.
++#ifdef MC_NCOL
++#define Q8MC_MAXC MC_NCOL
++#define Q8MC_NCOL MC_NCOL
++#else
+ #define Q8MC_MAXC 8
++#define Q8MC_NCOL ncol
++#endif
+ #ifndef MC_R0
+ #define MC_R0 4
+ #endif
+@@ -449,7 +457,7 @@ kernel void kernel_mul_mv_q8_0_q8a_dp4a_mc(
+         }
+         #pragma unroll
+         for (int c = 0; c < Q8MC_MAXC; c++) {
+-            if (c >= ncol) break;
++            if (c >= Q8MC_NCOL) break;
+             const uint2 a  = as_uint2(vload8(0, qa + (ulong)c*ne00 + ib*QK8_0 + il*NB_Q8_0));
+             const float dc = da[c*nb + ib];
+             for (int r = 0; r < MC_R0; r++) {
+@@ -462,7 +470,7 @@ kernel void kernel_mul_mv_q8_0_q8a_dp4a_mc(
+ 
+     #pragma unroll
+     for (int c = 0; c < Q8MC_MAXC; c++) {
+-        if (c >= ncol) break;
++        if (c >= Q8MC_NCOL) break;
+         global float * dst_f32 = (global float *) dst + (ulong)c*ne0;
+         for (int r = 0; r < MC_R0; r++) {
+             const float tot = sub_group_reduce_add(sumf[c][r]);
+@@ -530,7 +538,7 @@ kernel void kernel_mul_mv_q8_0_q8a_dp4a_mc_lds(
+         }
+         #pragma unroll
+         for (int c = 0; c < Q8MC_MAXC; c++) {
+-            if (c >= ncol) break;
++            if (c >= Q8MC_NCOL) break;
+             const uint2 a  = vload2(0, qa_l + (c*ne00 + ib*QK8_0 + il*NB_Q8_0) / 4);
+             const float dc = da_l[c*nb + ib];
+             for (int r = 0; r < MC_R0; r++) {
+@@ -543,7 +551,7 @@ kernel void kernel_mul_mv_q8_0_q8a_dp4a_mc_lds(
+ 
+     #pragma unroll
+     for (int c = 0; c < Q8MC_MAXC; c++) {
+-        if (c >= ncol) break;
++        if (c >= Q8MC_NCOL) break;
+         global float * dst_f32 = (global float *) dst + (ulong)c*ne0;
+         for (int r = 0; r < MC_R0; r++) {
+             const float tot = sub_group_reduce_add(sumf[c][r]);
+-- 
+2.55.0.windows.5
+

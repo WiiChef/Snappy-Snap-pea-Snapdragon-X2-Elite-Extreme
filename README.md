@@ -23,7 +23,7 @@ Agent-prompt bench: 4 coding and agent prompts × 2 seeds, temp 0.6, 400 generat
 |---|---|
 | Plain decode (no speculation) | 31.9 |
 | MTP on the stock fork | 39.6 |
-| **MTP + snap-pea** | **45.4** (+43% vs plain, +15% vs stock MTP) |
+| **MTP + snap-pea** | **46.4** (+45% vs plain, +17% vs stock MTP) |
 | MTP decode after an 85k-token prompt | 15.2 → **26.5** |
 
 - **Prefill:** about 550 tok/s from an empty context, 473 tok/s at 8k and 332 tok/s at 32k, close to the GPU's compute peak.
@@ -70,10 +70,14 @@ The code each kernel adds is extracted in [kernels/](kernels/). The full, applic
 | Q4_0 draft head | At load, requantizes the first 96k rows of the Q8_0 output head to Q4_0 (108 MiB), used by the drafter only. It raised acceptance from 77.8% to 80.5% and decode from 42.6 to 43.9 tok/s. | opt-in: `LLAMA_MTP_DRAFT_HEAD_Q4=1`, `LLAMA_MTP_DRAFT_VOCAB` |
 | Fast draft top-k | Scans the real vocab rows for the top 10 and admits zeros from the padded rows exactly where they rank. This replaces the sampler's full 248k sort. | `GGML_MTP_FAST_TOPK=0` |
 | Small-graph flush | `clFlush` every 8 nodes on graphs of 256 nodes or fewer (the draft steps). | `GGML_OPENCL_FLUSH_EVERY=N` |
+| Fixed-width verify GEMVs | Each of the dp4a verify GEMVs above is built once per width (`-DMC_NCOL=2..8`), so registers and local reduction memory are sized for the actual verify width rather than 8. The arithmetic is unchanged and the output is token-identical. +2.2% (45.4 to 46.4 tok/s, faster on all 8 runs). | `GGML_OPENCL_Q8_MC_FIXED=0` |
+| FA PV unroll | Unrolls the PV loop of the dk=256 decode kernel by 2. Same arithmetic order. +1.5–2% decode at 64k context; 4 is flat and 8 is slower. | `GGML_OPENCL_FA_PV_UNROLL=n` (1 = off) |
 | Timing | Prints the host/GPU split of draft time at exit. | opt-in: `GGML_MTP_TIMING=1` |
-| Chained drafting | k draft steps in one graph. Identical drafts, but not faster (41.3 vs 43.7 tok/s). | opt-in: `LLAMA_MTP_CHAIN=k` |
 
-[patches/experimental](patches/experimental) holds our port of upstream #27694, probabilistic MTP drafting with rejection-sampling verify (`--spec-draft-sampling probabilistic`). It measured no gain: 45.1 tok/s at p-min 0.8 vs 45.4 greedy.
+[patches/experimental](patches/experimental) holds two opt-in experiments that measured no gain:
+
+- **Chained drafting** (patches 0001–0002, `LLAMA_MTP_CHAIN=k`; they apply on live patch 0017). Runs k draft steps in one graph. The drafts are identical but not faster: 41.3 vs 43.7 tok/s, because the graph is rebuilt every round.
+- **Probabilistic MTP drafting** (patch 0003, `--spec-draft-sampling probabilistic`). A port of upstream #27694 with rejection-sampling verify, written against the fork at `8085b4e`. 45.1 tok/s at p-min 0.8 vs 45.4 greedy.
 
 ## What didn't help
 
@@ -87,6 +91,7 @@ All of these are measured, with details in [RESULTS.md](RESULTS.md).
 - q8 draft KV: worse at short context.
 - Chained drafting.
 - Probabilistic drafting.
+- Longer drafts (n-max 10 and 12, the precondition for 9–16-column verify kernels): accepted tokens stay flat (2198 and 2214 vs 2227 at n-max 7) because drafts past 7 are almost always rejected. Wider kernels and adaptive n-max therefore have nothing to gain on this workload.
 - Deferring the catch-up decode: acceptance dropped from 73% to 62%.
 
 **Kernel experiments:**

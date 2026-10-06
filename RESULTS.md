@@ -99,3 +99,7 @@ measured streaming bandwidth), drafting ~16% (GPU ~1.45 ms/step + ~0.9 ms llama_
 - Qualcomm fork merge to 8085b4e (add+rms_norm fusion etc., mostly Adreno 850/dk128): 45.4 vs 45.3 - neutral (dev branch only).
 - Upstream #27694 probabilistic MTP drafting + rejection verify, ported (dev 8f59bcd, opt-in): p-min 0.6 43.8, 0.8 45.1, 0.9 42.1 vs greedy 45.4 - no gain; draft already ~81% accepted.
 - Context: GPU shared allocs fail at ~31.0 GiB; 128k/160k crash mid-prefill; 98k is the ceiling. Only ~6 GB RAM free with server up, so --cache-ram stays 4096.
+
+- 2026-10-05 late: fixed-width (-DMC_NCOL) verify GEMVs +2.2% (45.4 -> 46.4, identical outputs); FA dk256 PV unroll 2 +1.5-2% at 64k. n-max 10/12: accepted tokens flat (2198/2214 vs 2227), drafts past 7 mostly rejected -> wider verify kernels and adaptive n-max not worth it. Live (mtp-smallbatch 8867485): 46.3 tok/s, agentbench 9/10 (09-wait-health timing check, flaky: fails ~half of all q6k runs).
+- Live switched to d289633 (no fork merge; outputs identical to merged build, 2227 acc). Task 9 reruns: new 3/5 vs morning binary 6/6 (chance ~18%).
+- 2026-10-06: seeded bench shows morning binary == a89c4bf == d289633 == fork-merged build token for token (2227). Live = a89c4bf, 46.4 tok/s.

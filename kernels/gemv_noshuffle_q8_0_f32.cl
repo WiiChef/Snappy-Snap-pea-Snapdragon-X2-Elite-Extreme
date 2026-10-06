@@ -13,7 +13,13 @@
 // ============================================================================
 #ifdef cl_khr_integer_dot_product
 #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
+#ifdef MC_NCOL
+#define NS_MC_MAX MC_NCOL
+#define NS_MC_NCOL MC_NCOL
+#else
 #define NS_MC_MAX 8
+#define NS_MC_NCOL ncol
+#endif
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_64
 #endif
@@ -58,7 +64,7 @@ __kernel void kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk(
         const float dw = convert_float(src0_d[gid_s + k * M]);
         #pragma unroll
         for (int c = 0; c < NS_MC_MAX; ++c) {
-            if (c < ncol) {
+            if (c < NS_MC_NCOL) {
                 const uint8 a = vload8(c * nbk + k, qa);
                 int acc = dot_acc_sat_4x8packed_ss_int(w0, a.s0, 0);
                 acc = dot_acc_sat_4x8packed_ss_int(w1, a.s1, acc);
@@ -77,14 +83,14 @@ __kernel void kernel_gemv_noshuffle_q8_0_q8a_dp4a_mc_splitk(
     if (groupId > 0) {
         #pragma unroll
         for (int c = 0; c < NS_MC_MAX; ++c) {
-            if (c < ncol) red[(64 * (groupId - 1) + lid) * NS_MC_MAX + c] = total[c];
+            if (c < NS_MC_NCOL) red[(64 * (groupId - 1) + lid) * NS_MC_MAX + c] = total[c];
         }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     if (groupId == 0 && gid < M) {
         #pragma unroll
         for (int c = 0; c < NS_MC_MAX; ++c) {
-            if (c < ncol) {
+            if (c < NS_MC_NCOL) {
                 float v = total[c];
                 for (uint i = 0; i + 1 < nsg; ++i) v += red[(64 * i + lid) * NS_MC_MAX + c];
                 partial[((ulong) kslice * ncol + c) * M + gid] = v;
